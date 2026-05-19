@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpatk"
+version = "0.1.0"
+description = "Cell Painting Analysis Toolkit for generic high-content profiling, QC, classical analysis, optional AI integration, MOA classification and reporting."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "Pete Thorpe and collaborators"}]
+license = {text = "MIT"}
+dependencies = [
+    "numpy>=1.23",
+    "pandas>=1.5",
+    "scipy>=1.9",
+    "scikit-learn>=1.1",
+    "matplotlib>=3.6",
+    "openpyxl>=3.1",
+    "jinja2>=3.1"
+]
+
+[project.optional-dependencies]
+interactive = ["plotly>=5.0"]
+umap = ["umap-learn>=0.5"]
+parquet = ["pyarrow>=10.0"]
+all = ["plotly>=5.0", "umap-learn>=0.5", "pyarrow>=10.0"]
+
+[project.scripts]
+cpatk-inspect = "cpatk.cli.inspect:main"
+cpatk-preprocess = "cpatk.cli.preprocess:main"
+cpatk-classical = "cpatk.cli.classical:main"
+cpatk-moa = "cpatk.cli.moa:main"
+cpatk-report = "cpatk.cli.report:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cpatk*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
