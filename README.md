@@ -1,94 +1,61 @@
 # CPATK: Cell Painting Analysis Toolkit
 
-CPATK is a generic toolkit for Cell Painting and high-content profiling analyses. It is designed to replace project-specific scripts with a modular, testable and reproducible workflow.
+CPATK is a generic, extensible toolkit for Cell Painting / high-content profiling analysis. It supports defensive preprocessing, QC, classical analysis, optional CLIPn/AI integration, replicate and cluster stability, batch/domain-shift diagnostics, MOA classification, feature attribution and HTML/Excel reporting.
 
-This first development version is deliberately generic. It does not assume sperm data, acrosome staining, one particular plate layout, or one particular biological question. The earlier `clipn` scripts were used as inspiration for the workflow design, but CPATK is organised as a reusable package.
+Version: **0.2.4**
 
-## Design goals
+## Design principles
 
-- Work with generic CellProfiler/Cell Painting profile tables.
-- Support object-level to profile-level aggregation.
-- Perform robust preprocessing and QC.
-- Write Parquet for large intermediate tables.
-- Write TSV tables, formatted Excel summaries and HTML reports.
-- Produce static PDF/SVG plots and optional interactive HTML plots.
-- Support non-AI classical analysis as a first-class workflow.
-- Keep AI/CLIPn-style analysis optional, so the rest of the toolkit remains usable without AI dependencies.
-- Provide a route towards mode-of-action classification.
-- Include extensive logging and unit tests.
-
-## Current modules
-
-```text
-cpatk/
-    ai.py                Optional AI/CLIPn backend status and future adapter hooks
-    clustering.py        K-means, agglomerative clustering, DBSCAN and summaries
-    distances.py         Pairwise distances and nearest-neighbour analysis
-    embedding.py         PCA, UMAP-if-available, and t-SNE helpers
-    features.py          Metadata/feature inference and feature summaries
-    inspection.py        Generic table inspection workflow
-    io.py                TSV, Parquet, Excel, HTML table helpers
-    logging_utils.py     Logging setup
-    moa.py               Centroid and KNN mode-of-action classification
-    plotting.py          Static and optional interactive plotting
-    preprocessing.py     QC, imputation, scaling and correlation filtering
-    qc.py                Feature-level, sample-level and outlier QC helpers
-    reporting.py         Simple HTML report generation
-    cli/                 Command-line entry points
-```
+- Generic across Cell Painting projects rather than tied to one assay.
+- Metadata and feature handling must be explicit and auditable.
+- Classical non-AI analysis is a first-class workflow, not just a fallback.
+- Optional AI/CLIPn integration must be defensive and not required for basic use.
+- Every workflow should write TSV outputs, formatted Excel summaries, logs and HTML reports where appropriate.
+- Unit tests use `unittest`.
 
 ## Installation
 
-From the package folder:
-
 ```bash
+cd cpatk_v0_2_2_full
 python -m pip install -e .
-```
-
-Recommended extras if available:
-
-```bash
-python -m pip install -e '.[all]'
-```
-
-## Run the tests
-
-```bash
 python -m unittest discover -s tests -v
 ```
 
-The current development version passes 42 unit tests in the build environment.
-
-## Example workflow
-
-### 1. Inspect input tables
+Optional dependencies:
 
 ```bash
-cpatk-inspect \
-  --input_dir /path/to/input_tables \
-  --output_dir /path/to/results/00_inspection \
-  --log_level INFO
+python -m pip install pyarrow plotly umap-learn shap
 ```
 
-Outputs include:
+`pyarrow` enables Parquet output. Without it, CPATK falls back to `.tsv.gz` and logs the reason.
+
+## Command-line tools
 
 ```text
-file_inventory.tsv
-file_summary.tsv
-column_inventory.tsv
-inspection_summary.xlsx
-inspect.log
+cpatk-inspect
+cpatk-preprocess
+cpatk-classical
+cpatk-layout
+cpatk-stability
+cpatk-batch
+cpatk-ml
+cpatk-explain
+cpatk-clipn
+cpatk-moa
+cpatk-report
 ```
 
-### 2. Preprocess profiles
+## Preprocessing
 
-For a profile-level table:
+The v0.2.2 preprocessing workflow is intentionally conservative. It writes an auditable column role table, removes obvious technical/provenance columns from default features, imputes missing values, optionally normalises to reference controls, scales features and optionally removes highly correlated features.
+
+Basic preprocessing:
 
 ```bash
 cpatk-preprocess \
-  --input_table /path/to/profiles.tsv \
-  --output_dir /path/to/results/01_preprocess \
-  --metadata_columns Metadata_Plate,Metadata_Well,compound,moa \
+  --input_table profiles.tsv \
+  --output_dir results/01_preprocess \
+  --metadata_columns Metadata_Plate,Metadata_Well,Metadata_Compound,Metadata_MOA,Metadata_Batch \
   --imputation_method median \
   --scaling_method robust \
   --max_feature_missing_fraction 0.2 \
@@ -97,136 +64,240 @@ cpatk-preprocess \
   --log_level INFO
 ```
 
-For an object-level table that needs aggregation:
+Control/reference normalisation, for example DMSO within plate:
 
 ```bash
 cpatk-preprocess \
-  --input_table /path/to/object_level.tsv.gz \
-  --output_dir /path/to/results/01_preprocess \
-  --metadata_columns Metadata_Plate,Metadata_Well,compound,moa \
-  --aggregate_by Metadata_Plate,Metadata_Well,compound,moa \
-  --aggregate_statistic median \
-  --log_level INFO
+  --input_table profiles.tsv \
+  --output_dir results/01_preprocess_dmso_reference \
+  --metadata_columns Metadata_Plate,Metadata_Well,Metadata_Compound,Metadata_MOA \
+  --reference_normalisation_method robust_z \
+  --reference_column Metadata_Compound \
+  --reference_values DMSO \
+  --reference_group_columns Metadata_Plate \
+  --imputation_method median \
+  --scaling_method robust
 ```
 
-Outputs include:
+Optional batch centering sensitivity analysis:
+
+```bash
+cpatk-preprocess \
+  --input_table profiles.tsv \
+  --output_dir results/01_preprocess_batch_centered \
+  --batch_centering_method median_center \
+  --batch_centering_columns Metadata_Batch \
+  --imputation_method median \
+  --scaling_method robust
+```
+
+Main preprocessing outputs:
 
 ```text
-preprocessed.parquet
+preprocessed.parquet or preprocessed.tsv.gz
+imputed_unscaled_features_with_metadata.tsv
 feature_qc.tsv
 sample_qc.tsv
+column_role_report.tsv
+imputation_report.tsv
+reference_normalisation_report.tsv
+batch_centering_report.tsv
 correlation_filter_report.tsv
 retained_features.tsv
-preprocessing_summary.tsv
+feature_family_summary.tsv
+preprocessing_decision_log.tsv
+preprocessing_config.tsv
 preprocessing_summary.xlsx
+preprocessing_report.html
 preprocess.log
+plots/
 ```
 
-### 3. Run non-AI classical analysis
+## Classical non-AI analysis
 
 ```bash
 cpatk-classical \
-  --input_table /path/to/results/01_preprocess/preprocessed.parquet \
-  --output_dir /path/to/results/02_classical \
-  --metadata_columns Metadata_Plate,Metadata_Well,compound,moa \
-  --id_column compound \
-  --colour_column moa \
-  --cluster_group_columns moa,compound \
+  --input_table results/01_preprocess/preprocessed.parquet \
+  --output_dir results/02_classical \
+  --metadata_columns Metadata_Plate,Metadata_Well,Metadata_Compound,Metadata_MOA \
+  --id_column Metadata_Compound \
+  --colour_column Metadata_MOA \
+  --cluster_group_columns Metadata_MOA,Metadata_Compound \
   --distance_metric cosine \
   --n_neighbours 10 \
   --n_clusters 8 \
-  --log_level INFO
+  --run_tsne
 ```
 
-Outputs include:
+This generates PCA, UMAP/PCA fallback, optional t-SNE, pairwise distances, nearest neighbours, clustering outputs, static plots and interactive Plotly outputs when Plotly is installed.
 
-```text
-pca_scores.tsv
-pca_explained_variance.tsv
-embedding.tsv
-pairwise_distances.tsv.gz
-nearest_neighbours.tsv
-clusters.tsv
-cluster_summary.tsv
-cluster_silhouette_summary.tsv
-embedding_static.pdf
-embedding_static.svg
-embedding_interactive.html
-classical_analysis_summary.xlsx
-classical.log
+## Stability and clustering confidence
+
+```bash
+cpatk-stability \
+  --input_table results/01_preprocess/preprocessed.parquet \
+  --output_dir results/03_stability \
+  --metadata_columns Metadata_Plate,Metadata_Well,Metadata_Compound,Metadata_MOA \
+  --cluster_group_columns Metadata_MOA,Metadata_Compound \
+  --n_clusters 8 \
+  --n_bootstrap 100 \
+  --n_permutations 100
 ```
 
-### 4. Run centroid-based MOA scoring
+Cluster permutation testing compares the observed clustering score with feature-wise permutation null scores. This does not prove the true number of clusters, but it helps determine whether clustering is stronger than expected from scrambled feature structure.
+
+## Batch and domain-shift diagnostics
+
+```bash
+cpatk-batch \
+  --input_table results/01_preprocess/preprocessed.parquet \
+  --output_dir results/04_batch \
+  --metadata_columns Metadata_Plate,Metadata_Well,Metadata_Compound,Metadata_MOA,Metadata_Batch \
+  --batch_column Metadata_Batch
+```
+
+## MOA analysis
+
+Centroid MOA scoring with confidence margins:
 
 ```bash
 cpatk-moa \
-  --input_table /path/to/results/01_preprocess/preprocessed.parquet \
-  --output_dir /path/to/results/03_moa \
-  --metadata_columns Metadata_Plate,Metadata_Well,compound,moa \
-  --class_column moa \
+  --input_table results/01_preprocess/preprocessed.parquet \
+  --output_dir results/05_moa \
+  --class_column Metadata_MOA \
+  --metadata_columns Metadata_Plate,Metadata_Well,Metadata_Compound,Metadata_MOA \
   --min_class_size 2 \
   --metric cosine \
   --top_n 5 \
-  --log_level INFO
+  --run_knn
 ```
 
-Outputs include:
+Outputs include centroid scores, top predictions, leave-one-out centroid validation, optional KNN predictions, confidence plots, Excel summary and `moa_report.html`.
 
-```text
-moa_centroids.tsv
-moa_class_summary.tsv
-moa_centroid_scores.tsv
-moa_top_predictions.tsv
-moa_prediction_summary.tsv
-moa_summary.xlsx
-moa.log
-```
-
-### 5. Create an HTML report
+## Supervised ML classifiers
 
 ```bash
-cpatk-report \
-  --output_html /path/to/results/summary_report.html \
-  --title "Cell Painting analysis report" \
-  --narrative "Distribution-first Cell Painting analysis using CPATK." \
-  --table /path/to/results/01_preprocess/preprocessing_summary.tsv \
-  --table /path/to/results/02_classical/cluster_summary.tsv \
-  --table /path/to/results/03_moa/moa_prediction_summary.tsv \
-  --plot /path/to/results/02_classical/embedding_static.svg \
-  --log_level INFO
+cpatk-ml \
+  --input_table results/01_preprocess/preprocessed.parquet \
+  --output_dir results/06_ml \
+  --class_column Metadata_MOA \
+  --metadata_columns Metadata_Plate,Metadata_Well,Metadata_Compound,Metadata_MOA \
+  --compare_models \
+  --n_splits 5
 ```
 
-## QC philosophy
+Supported models include KNN, random forest, extra trees, gradient boosting, logistic regression and calibrated linear SVM.
 
-CPATK separates technical quality control from biological interpretation. The default QC steps include:
+## Feature attribution: permutation importance and SHAP
 
-- feature missingness summaries
-- sample/profile missingness summaries
-- near-zero variance filtering
-- minimum unique value checks
-- optional robust profile outlier detection
-- imputation after QC
-- robust or standard scaling
-- optional highly correlated feature filtering
+```bash
+cpatk-explain \
+  --input_table results/01_preprocess/preprocessed.parquet \
+  --output_dir results/07_feature_attribution \
+  --class_column Metadata_MOA \
+  --metadata_columns Metadata_Plate,Metadata_Well,Metadata_Compound,Metadata_MOA \
+  --model_name random_forest \
+  --n_repeats 20 \
+  --include_shap
+```
 
-For assay-specific workflows, CPATK should avoid filtering directly on the biological outcome feature unless there is an independent technical justification.
+Permutation importance is the safest default. SHAP is optional and will write a clear status table if the dependency or model-specific explainer is unavailable.
 
-## Classical analysis versus AI analysis
+## CLIPn adapter
 
-The classical route uses distances, embeddings, clustering, nearest neighbours and centroid/KNN MOA scoring. This is always available.
+The CLIPn adapter is defensive. It aligns datasets, checks backend availability and writes status/provenance tables. It does not make CLIPn a hard dependency of CPATK.
 
-The AI route is optional. Version 0.1.0 includes explicit backend availability checks and a placeholder adapter for future CLIPn integration. This is intentional: users should be able to run robust non-AI analysis even when CLIPn or other AI models are not installed.
+```bash
+cpatk-clipn \
+  --dataset reference1=results/ref1_preprocessed.parquet \
+  --dataset reference2=results/ref2_preprocessed.parquet \
+  --dataset query=results/query_preprocessed.parquet \
+  --output_dir results/08_clipn \
+  --metadata_columns Metadata_Plate,Metadata_Well,Metadata_Compound,Metadata_MOA
+```
 
-## Development roadmap
+## Critical evaluation notes
 
-Planned future additions:
+See:
 
-- full CLIPn adapter with save/load projection workflow
-- richer interactive dashboards
-- plate-layout diagnostics and batch-effect modelling
-- replicate-correlation analysis
-- consensus nearest-neighbour stability across runs
-- richer MOA classification with calibration and uncertainty
-- SHAP/permutation feature attribution for classification decisions
-- CellProfiler-specific object/table merge helpers
-- project templates for common Cell Painting experiments
+```text
+docs/CPATK_v0_2_2_critical_evaluation.md
+docs/CPATK_preprocessing_rationale_v0_2_2.md
+```
+
+## Test status
+
+The v0.2.2 package passed:
+
+```text
+Ran 91 tests
+OK
+```
+
+## v0.2.3 folder input and profile building
+
+CPATK can now start from a folder of Cell Painting files instead of requiring a
+single pre-merged profile table.  The new command is:
+
+```bash
+cpatk-build-profiles \
+  --input_dir /path/to/cellpainting_folder \
+  --output_dir results/00_profile_build \
+  --recursive \
+  --aggregate_statistic median
+```
+
+The profile builder accepts `.csv`, `.csv.gz`, `.tsv`, `.tsv.gz`, `.parquet` and
+Excel files.  It infers Image, object and metadata tables from the file headers,
+uses the Image/profile table as the backbone, aggregates object tables to
+`ImageNumber`, and merges external plate/well metadata where available.  It does
+not blindly join separate Cell/Cytoplasm/Nuclei object tables by `ObjectNumber`.
+
+You can also build and preprocess in one command:
+
+```bash
+cpatk-preprocess \
+  --input_dir /path/to/cellpainting_folder \
+  --output_dir results/01_preprocess \
+  --recursive \
+  --metadata_table /path/to/metadata.tsv \
+  --imputation_method median \
+  --scaling_method robust
+```
+
+This writes `results/01_preprocess/00_profile_build/` plus all normal
+preprocessing outputs, including imputation reports, plots, Excel summaries and
+HTML reports.
+
+
+## v0.2.4 critical refinements
+
+This release strengthens the parts of CPATK that are most important for defensible Cell Painting analysis:
+
+- folder-level profile building now supports multiple metadata/platemap tables supplied as a comma-separated list;
+- row and column metadata can be standardised to `Metadata_Row` and `Metadata_Column`, and `Metadata_Well` can be derived as `A01`, `B03`, etc. when needed;
+- CSV/CSV.GZ reading uses UTF-8-SIG handling to avoid BOM problems in messy metadata files;
+- preprocessing now converts positive/negative infinity to missing values before QC and writes `nonfinite_value_report.tsv`;
+- feature QC now reports exact-zero fractions and supports an optional `--max_zero_fraction` filter;
+- cluster permutation testing now has a detailed mode that writes the null distribution as well as the summary p-value;
+- stability workflows can evaluate a range of K values using silhouette, permutation testing and bootstrap ARI;
+- MOA analysis now includes a separability diagnostic comparing within-MOA and between-MOA distances against shuffled labels;
+- stability CLI now writes a richer HTML report describing the caveats around cluster-number selection.
+
+Recommended first-pass workflow from a raw Cell Painting folder:
+
+```bash
+cpatk-preprocess   --input_dir /path/to/cellpainting_exports   --output_dir results/01_preprocess   --recursive   --metadata_table plate_map.tsv,compound_annotations.csv   --imputation_method median   --scaling_method robust   --max_feature_missing_fraction 0.2   --max_sample_missing_fraction 0.5   --max_absolute_correlation 0.95   --log_level INFO
+```
+
+Optional zero-heavy feature filtering can be enabled when exact-zero-heavy features are clearly artefactual:
+
+```bash
+cpatk-preprocess   --input_table profiles.tsv   --output_dir results/01_preprocess_zero_filter   --max_zero_fraction 0.95
+```
+
+Cluster-number confidence should be assessed with several diagnostics rather than a single UMAP:
+
+```bash
+cpatk-stability   --input_table results/01_preprocess/preprocessed.parquet   --output_dir results/04_stability   --metadata_columns Metadata_Plate,Metadata_Well,Metadata_Compound,Metadata_MOA   --replicate_group_columns Metadata_Compound,Metadata_MOA   --n_clusters 8   --k_values 2,3,4,5,6,7,8,9,10   --n_bootstraps 100   --n_permutations 100
+```

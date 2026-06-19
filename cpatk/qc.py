@@ -37,6 +37,8 @@ def calculate_feature_qc(
                 "median": float(values.median(skipna=True)),
                 "mad": float((values - values.median(skipna=True)).abs().median(skipna=True)),
                 "n_unique": int(values.nunique(dropna=True)),
+                "zero_fraction": float((values == 0).mean()) if len(values) else 0.0,
+                "finite_fraction": float(np.isfinite(values.to_numpy(dtype=float, copy=False)).mean()) if len(values) else 0.0,
                 "near_zero_variance": bool(values.var(skipna=True) <= 1e-12),
                 "all_missing": bool(values.notna().sum() == 0),
             }
@@ -82,6 +84,7 @@ def select_features_by_qc(
     max_missing_fraction: float = 0.2,
     min_variance: float = 1e-12,
     min_unique_values: int = 2,
+    max_zero_fraction: float = 1.0,
 ) -> Tuple[List[str], pd.DataFrame]:
     """Select features passing missingness and variance thresholds.
 
@@ -95,6 +98,8 @@ def select_features_by_qc(
         Minimum allowed variance.
     min_unique_values:
         Minimum number of unique non-missing values.
+    max_zero_fraction:
+        Maximum allowed fraction of exact zero values. Leave at 1.0 to disable.
 
     Returns
     -------
@@ -105,8 +110,9 @@ def select_features_by_qc(
     qc["pass_missingness"] = qc["missing_fraction"] <= max_missing_fraction
     qc["pass_variance"] = qc["variance"].fillna(0) > min_variance
     qc["pass_unique_values"] = qc["n_unique"] >= min_unique_values
+    qc["pass_zero_fraction"] = qc.get("zero_fraction", 0.0) <= max_zero_fraction
     qc["feature_qc_pass"] = qc[
-        ["pass_missingness", "pass_variance", "pass_unique_values"]
+        ["pass_missingness", "pass_variance", "pass_unique_values", "pass_zero_fraction"]
     ].all(axis=1)
     selected = qc.loc[qc["feature_qc_pass"], "feature"].astype(str).tolist()
     return selected, qc

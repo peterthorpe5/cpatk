@@ -50,7 +50,7 @@ def read_table(
     if suffixes.endswith(".tsv") or suffixes.endswith(".tsv.gz"):
         return pd.read_csv(filepath_or_buffer=path, sep="\t")
     if suffixes.endswith(".csv") or suffixes.endswith(".csv.gz"):
-        return pd.read_csv(filepath_or_buffer=path)
+        return pd.read_csv(filepath_or_buffer=path, encoding="utf-8-sig", low_memory=False)
     if suffixes.endswith(".xlsx") or suffixes.endswith(".xls"):
         return pd.read_excel(io=path, sheet_name=sheet_name or 0)
 
