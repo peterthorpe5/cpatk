@@ -1,0 +1,9 @@
+Metadata_Plate	Metadata_Well	Metadata_Compound	Metadata_MOA	Metadata_Dose	Metadata_Batch	cpd_type	Replicate	Donor	Timepoint	Notes
+Plate_001	A01	DMSO	negative_control	0	Batch_001	control	1	Donor_01	24h	Vehicle control
+Plate_001	A02	Ionomycin	calcium_ionophore	10uM	Batch_001	positive_control	1	Donor_01	24h	Positive-control example
+Plate_001	A03	Compound_001	unknown	1uM	Batch_001	test	1	Donor_01	24h	Example treatment
+Plate_001	A04	Compound_002	unknown	1uM	Batch_001	test	1	Donor_01	24h	Example treatment
+Plate_002	A01	DMSO	negative_control	0	Batch_001	control	2	Donor_02	24h	Vehicle control
+Plate_002	A02	Ionomycin	calcium_ionophore	10uM	Batch_001	positive_control	2	Donor_02	24h	Positive-control example
+Plate_002	A03	Compound_001	unknown	1uM	Batch_001	test	2	Donor_02	24h	Example treatment
+Plate_002	A04	Compound_002	unknown	1uM	Batch_001	test	2	Donor_02	24h	Example treatment

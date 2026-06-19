@@ -384,3 +384,109 @@ feature_explanation_summary.xlsx
 ```
 
 Interpretation: the feature-statistics tables describe direct query-vs-background differences using median differences, Wasserstein distances, Mann-Whitney or Kolmogorov-Smirnov tests and BH-FDR correction.  The SHAP tables and plots explain the fitted local query-vs-neighbour classifier.  They are useful for biological hypothesis generation, but they do not prove causality.
+
+## v0.2.7 CLIPn adapter upgrade
+
+CPATK v0.2.7 substantially upgrades the optional CLIPn layer.  The previous
+adapter only checked for a backend and made a best-effort call to a generic
+model.  The new workflow is closer to the mature project scripts while keeping
+CPATK generic and dependency-safe.
+
+New CLIPn features include:
+
+- dataset manifests with `dataset` and `path` columns;
+- repeated `--dataset name=path` inputs for quick runs;
+- CSV, TSV, gzipped CSV/TSV, Parquet and Excel input through the standard CPATK reader;
+- metadata alias standardisation for compound, MOA/class, plate, well and library columns;
+- shared-feature intersection across datasets with full audit tables;
+- strict exclusion of metadata, IDs and technical columns from CLIPn features;
+- non-finite and extreme-value cleanup before imputation;
+- median, mean, KNN or no imputation;
+- robust, standard or no scaling;
+- `integrate_all` and `reference_only` modes;
+- optional PCA fallback for debugging when CLIPn is unavailable;
+- backend run status tables rather than silent failure;
+- latent-space diagnostics including nearest-neighbour summaries, latent variance and silhouette checks;
+- static PCA/UMAP-or-PCA plots and interactive HTML embeddings;
+- formatted Excel and HTML summary reports.
+
+Example manifest:
+
+```text
+
+dataset	path
+reference1	results/reference1/preprocessed.tsv.gz
+reference2	results/reference2/preprocessed.tsv.gz
+query	results/query/preprocessed.tsv.gz
+```
+
+Example command:
+
+```bash
+cpatk-clipn \
+  --datasets_csv datasets.tsv \
+  --output_dir results/08_clipn \
+  --experiment cellpainting_clipn \
+  --mode reference_only \
+  --reference_names reference1,reference2 \
+  --latent_dim 20 \
+  --epochs 500 \
+  --lr 1e-5 \
+  --imputation_method median \
+  --scaling_method robust \
+  --n_neighbours 15 \
+  --log_level INFO
+```
+
+If the CLIPn backend is not installed, the workflow still writes the feature,
+metadata, preprocessing and backend-status audit files.  Add
+`--allow_pca_fallback` only for debugging the downstream reporting structure;
+that output is labelled as PCA fallback and should not be reported as CLIPn.
+
+## v0.2.9 additions: QC, visualisation and full workflow
+
+CPATK v0.2.9 adds three new command-line workflows:
+
+```bash
+cpatk-drift-qc
+cpatk-visualise
+cpatk-neighbours
+```
+
+`cpatk-drift-qc` inspects object-level CellProfiler files before profile aggregation. It reports per-compartment acquisition drift using `ImageNumber`, Spearman correlation on per-image medians, early-vs-late median shifts, Cliff's delta and scalable drift plots.
+
+`cpatk-visualise` creates PCA, optional UMAP, optional PHATE, latent/profile norm checks, clustered heatmaps and k-nearest-neighbour topology plots from either CLIPn latent outputs or processed Cell Painting profiles.
+
+`cpatk-neighbours` creates top-neighbour plots, shared-neighbour scatter plots and overlap/RBO summaries for comparing nearest-neighbour outputs across runs.
+
+A full start-to-finish example shell script is provided at:
+
+```text
+examples/run_full_cpatk_pipeline.sh
+```
+
+An example metadata file and column guidance are provided at:
+
+```text
+examples/example_metadata.tsv
+examples/METADATA_REQUIREMENTS.md
+```
+
+Minimal recommended metadata columns are:
+
+```text
+Metadata_Plate
+Metadata_Well
+Metadata_Compound
+cpd_type
+```
+
+Strongly recommended columns include:
+
+```text
+Metadata_MOA
+Metadata_Dose
+Metadata_Batch
+Replicate
+Donor / CellLine / Timepoint where relevant
+```
