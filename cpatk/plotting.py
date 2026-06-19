@@ -443,6 +443,26 @@ def write_interactive_heatmap_html(
     return output_path
 
 
+def plot_all_zero_row_summary(
+    *,
+    all_zero_row_report: pd.DataFrame,
+    output_path_base: Path,
+    logger: Optional[logging.Logger] = None,
+) -> list[Path]:
+    """Plot counts of profiles flagged by the all-zero row filter."""
+    if all_zero_row_report.empty or "all_zero_feature_row" not in all_zero_row_report.columns:
+        return []
+    set_publication_theme()
+    labels = all_zero_row_report["all_zero_feature_row"].map({True: "all observed features zero", False: "has non-zero feature evidence"})
+    counts = labels.value_counts().reindex(["has non-zero feature evidence", "all observed features zero"]).fillna(0)
+    plt.figure(figsize=(7, 4.5))
+    plt.bar(x=counts.index.astype(str), height=counts.to_numpy(dtype=float))
+    plt.xticks(rotation=20, ha="right")
+    plt.ylabel("Number of profiles")
+    plt.title("All-zero feature-row QC")
+    return save_current_figure(output_path_base=output_path_base, logger=logger)
+
+
 def plot_missingness_histogram(
     *,
     qc_table: pd.DataFrame,
@@ -513,6 +533,7 @@ def plot_preprocessing_retention(
         raise ValueError("summary must contain item and value columns.")
     wanted = [
         "n_rows_input",
+        "n_all_zero_feature_rows_removed",
         "n_rows_passing_qc",
         "n_features_input",
         "n_features_after_qc",

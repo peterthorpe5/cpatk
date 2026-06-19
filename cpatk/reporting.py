@@ -162,7 +162,7 @@ def default_methods_text() -> str:
         "CPATK separates metadata from numeric Cell Painting features using an auditable column-role table. "
         "By default, obvious provenance and QC columns such as image identifiers, file names, checksums, execution times, "
         "object counts and image dimensions are not treated as biological morphology features unless explicitly requested.\n\n"
-        "Preprocessing applies feature-level and profile-level QC before imputation.  Median imputation is the default because "
+        "Preprocessing applies feature-level and profile-level QC before imputation. After all CellProfiler tables have been merged, rows whose observed retained feature values are all zero are removed by default, because these usually represent failed/empty profiles rather than valid morphology. Median imputation is the default because "
         "it is robust and avoids borrowing structure across treatments.  Group-median, mean, zero and KNN imputation are available, "
         "but KNN imputation should be used cautiously because it can smooth real batch or perturbation structure.\n\n"
         "Optional control/reference normalisation can centre profiles against reference wells such as DMSO within each plate or batch. "

@@ -39,6 +39,7 @@ def validate_preprocessing_parameters(
     max_absolute_correlation: float,
     min_unique_values: int,
     max_zero_fraction: float = 1.0,
+    all_zero_row_tolerance: float = 0.0,
 ) -> None:
     """Validate preprocessing thresholds before expensive work begins."""
     if not 0 <= max_feature_missing_fraction <= 1:
@@ -51,7 +52,8 @@ def validate_preprocessing_parameters(
         raise ValueError("min_unique_values must be at least 1.")
     if not 0 <= max_zero_fraction <= 1:
         raise ValueError("max_zero_fraction must be between 0 and 1.")
-
+    if all_zero_row_tolerance < 0:
+        raise ValueError("all_zero_row_tolerance must be non-negative.")
 
 
 
@@ -59,13 +61,16 @@ def replace_nonfinite_with_nan(
     *,
     features: pd.DataFrame,
     logger: Optional[logging.Logger] = None,
+    max_abs_finite_value: float = 1e10,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Replace positive/negative infinity with missing values and report counts.
+    """Replace unsafe non-finite or implausibly huge feature values with NaN.
 
     CellProfiler tables can occasionally contain infinite values after ratios or
-    normalisation. Treating them as real extreme biology is unsafe; CPATK
-    converts them to missing values before QC and imputation so the decision is
-    visible in the preprocessing reports.
+    malformed numeric values such as ``#DIV/0!``. Legacy project scripts also
+    treated extremely large finite values as unsafe, because they usually reflect
+    calculation or export artefacts rather than interpretable morphology. CPATK
+    therefore converts ``inf``, ``-inf`` and finite values whose absolute value
+    exceeds ``max_abs_finite_value`` to missing values before QC and imputation.
     """
     output = features.copy()
     records = []
@@ -73,21 +78,105 @@ def replace_nonfinite_with_nan(
         values = pd.to_numeric(output[feature], errors="coerce")
         pos_inf = int(np.isposinf(values).sum())
         neg_inf = int(np.isneginf(values).sum())
-        nonfinite = int((~np.isfinite(values.to_numpy(dtype=float, copy=False)) & values.notna().to_numpy()).sum())
+        finite = np.isfinite(values.to_numpy(dtype=float, copy=False))
+        not_missing = values.notna().to_numpy()
+        nonfinite = int((~finite & not_missing).sum())
+        extreme_mask = values.abs().gt(max_abs_finite_value) & np.isfinite(values)
+        n_extreme = int(extreme_mask.sum())
         values = values.replace([np.inf, -np.inf], np.nan)
+        values = values.mask(extreme_mask, np.nan)
         output[feature] = values
         records.append(
             {
                 "feature": feature,
                 "n_positive_infinity": pos_inf,
                 "n_negative_infinity": neg_inf,
+                "n_extreme_finite_values_replaced": n_extreme,
                 "n_nonfinite_replaced": nonfinite,
+                "n_total_values_replaced": nonfinite + n_extreme,
+                "max_abs_finite_value": max_abs_finite_value,
             }
         )
     report = pd.DataFrame.from_records(records)
     if logger is not None:
-        logger.info("Replaced %s non-finite feature values with missing values", int(report["n_nonfinite_replaced"].sum()))
+        logger.info(
+            "Replaced %s non-finite/extreme feature values with missing values",
+            int(report["n_total_values_replaced"].sum()),
+        )
     return output, report
+
+
+def calculate_all_zero_row_report(
+    *,
+    features: pd.DataFrame,
+    metadata: Optional[pd.DataFrame] = None,
+    tolerance: float = 0.0,
+    metadata_preview_columns: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Identify rows with no non-zero observed feature values.
+
+    This QC step is intentionally applied after all CellProfiler output tables
+    have been merged into a single feature matrix and after feature columns have
+    been selected.  A row is flagged when it has at least one observed feature
+    value and every observed feature value is zero, or within ``tolerance`` of
+    zero.  Missing values do not count as non-zero evidence; rows that are
+    entirely missing are handled separately by the sample/profile missingness
+    filter.
+
+    Parameters
+    ----------
+    features:
+        Numeric feature matrix after feature-level QC selection.
+    metadata:
+        Optional metadata table aligned to ``features``. A small set of useful
+        metadata columns is copied into the report for auditability.
+    tolerance:
+        Absolute tolerance used when deciding whether a value is zero.
+    metadata_preview_columns:
+        Optional metadata columns to include in the report. If omitted, common
+        metadata identifiers such as plate, well, compound and batch are used
+        when available.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per input profile with zero-row counts and flags.
+    """
+    if tolerance < 0:
+        raise ValueError("tolerance must be non-negative.")
+    numeric = features.apply(pd.to_numeric, errors="coerce")
+    observed = numeric.notna()
+    zero_like = numeric.abs().le(tolerance) & observed
+    n_observed = observed.sum(axis=1).astype(int)
+    n_zero_like = zero_like.sum(axis=1).astype(int)
+    n_nonzero = (observed & ~zero_like).sum(axis=1).astype(int)
+    all_zero = (n_observed > 0) & (n_nonzero == 0)
+    report = pd.DataFrame(
+        {
+            "row_index": features.index.to_numpy(),
+            "n_features_examined": int(features.shape[1]),
+            "n_observed_feature_values": n_observed.to_numpy(),
+            "n_zero_or_near_zero_observed_feature_values": n_zero_like.to_numpy(),
+            "n_nonzero_observed_feature_values": n_nonzero.to_numpy(),
+            "all_zero_feature_row": all_zero.to_numpy(dtype=bool),
+            "removed_by_all_zero_row_filter": False,
+        }
+    )
+    if metadata is not None and not metadata.empty:
+        default_columns = [
+            "Metadata_Plate",
+            "Metadata_Well",
+            "Metadata_Compound",
+            "Metadata_MOA",
+            "Metadata_Batch",
+            "cpd_id",
+            "cpd_type",
+        ]
+        wanted = list(metadata_preview_columns or default_columns)
+        for column in wanted:
+            if column in metadata.columns:
+                report[column] = metadata[column].reset_index(drop=True)
+    return report
 
 
 def add_missingness_indicators(
@@ -568,6 +657,8 @@ def preprocess_profiles(
     min_feature_variance: float = 1e-12,
     min_unique_values: int = 2,
     max_zero_fraction: float = 1.0,
+    remove_all_zero_rows: bool = True,
+    all_zero_row_tolerance: float = 0.0,
     remove_correlated: bool = True,
     max_absolute_correlation: float = 0.95,
     imputation_method: str = "median",
@@ -596,6 +687,7 @@ def preprocess_profiles(
         max_absolute_correlation=max_absolute_correlation,
         min_unique_values=min_unique_values,
         max_zero_fraction=max_zero_fraction,
+        all_zero_row_tolerance=all_zero_row_tolerance,
     )
     decisions: List[dict] = []
     if logger is not None:
@@ -647,7 +739,7 @@ def preprocess_profiles(
         decisions,
         "nonfinite_values",
         "Converted positive/negative infinity to missing values before QC",
-        n_values_replaced=int(nonfinite_report["n_nonfinite_replaced"].sum()) if not nonfinite_report.empty else 0,
+        n_values_replaced=int(nonfinite_report.get("n_total_values_replaced", nonfinite_report.get("n_nonfinite_replaced", pd.Series(dtype=int))).sum()) if not nonfinite_report.empty else 0,
     )
 
     feature_qc = calculate_feature_qc(features=features)
@@ -663,10 +755,43 @@ def preprocess_profiles(
     _decision_log(decisions, "feature_qc", "Applied feature missingness/variance/uniqueness filters", n_retained=len(selected_features), n_input=len(feature_names))
 
     selected_for_sample_qc = features.loc[:, selected_features]
-    sample_qc = calculate_sample_qc(features=selected_for_sample_qc, metadata=metadata)
+    all_zero_row_report = calculate_all_zero_row_report(
+        features=selected_for_sample_qc,
+        metadata=metadata.reset_index(drop=True),
+        tolerance=all_zero_row_tolerance,
+    )
+    if remove_all_zero_rows:
+        keep_non_zero_rows = ~all_zero_row_report["all_zero_feature_row"].to_numpy(dtype=bool)
+        all_zero_row_report.loc[all_zero_row_report["all_zero_feature_row"], "removed_by_all_zero_row_filter"] = True
+        n_all_zero_removed = int((~keep_non_zero_rows).sum())
+        metadata_for_sample_qc = metadata.loc[keep_non_zero_rows, :].reset_index(drop=True)
+        selected_for_sample_qc = selected_for_sample_qc.loc[keep_non_zero_rows, :].reset_index(drop=True)
+        _decision_log(
+            decisions,
+            "all_zero_row_filter",
+            "Removed profiles whose observed retained feature values were all zero after merged-table feature QC",
+            n_removed=n_all_zero_removed,
+            tolerance=all_zero_row_tolerance,
+        )
+        if logger is not None and n_all_zero_removed:
+            logger.warning(
+                "Removed %s all-zero feature rows after merged profile construction and before imputation",
+                n_all_zero_removed,
+            )
+    else:
+        metadata_for_sample_qc = metadata.reset_index(drop=True)
+        _decision_log(
+            decisions,
+            "all_zero_row_filter",
+            "All-zero row filter disabled",
+            n_flagged=int(all_zero_row_report["all_zero_feature_row"].sum()),
+            tolerance=all_zero_row_tolerance,
+        )
+
+    sample_qc = calculate_sample_qc(features=selected_for_sample_qc, metadata=metadata_for_sample_qc)
     sample_qc = flag_samples_by_qc(sample_qc=sample_qc, max_missing_fraction=max_sample_missing_fraction)
     passed_rows = sample_qc["sample_qc_pass"].to_numpy(dtype=bool)
-    selected_metadata = metadata.loc[passed_rows, :].reset_index(drop=True)
+    selected_metadata = metadata_for_sample_qc.loc[passed_rows, :].reset_index(drop=True)
     selected_feature_matrix = selected_for_sample_qc.loc[passed_rows, :].reset_index(drop=True)
     _decision_log(decisions, "sample_qc", "Applied profile/sample missingness filter", n_retained=int(passed_rows.sum()), n_input=len(passed_rows))
 
@@ -748,6 +873,8 @@ def preprocess_profiles(
             {"parameter": "remove_correlated", "value": str(remove_correlated)},
             {"parameter": "max_absolute_correlation", "value": str(max_absolute_correlation)},
             {"parameter": "max_zero_fraction", "value": str(max_zero_fraction)},
+            {"parameter": "remove_all_zero_rows", "value": str(remove_all_zero_rows)},
+            {"parameter": "all_zero_row_tolerance", "value": str(all_zero_row_tolerance)},
             {"parameter": "reference_normalisation_method", "value": reference_normalisation_method},
             {"parameter": "reference_column", "value": str(reference_column)},
             {"parameter": "reference_values", "value": ",".join(reference_values or [])},
@@ -763,7 +890,9 @@ def preprocess_profiles(
             {"item": "n_metadata_columns", "value": int(len(metadata_names))},
             {"item": "n_features_input", "value": int(len(feature_names))},
             {"item": "n_features_after_qc", "value": int(len(selected_features))},
-            {"item": "n_nonfinite_feature_values_replaced", "value": int(nonfinite_report["n_nonfinite_replaced"].sum()) if not nonfinite_report.empty else 0},
+            {"item": "n_nonfinite_or_extreme_feature_values_replaced", "value": int(nonfinite_report.get("n_total_values_replaced", nonfinite_report.get("n_nonfinite_replaced", pd.Series(dtype=int))).sum()) if not nonfinite_report.empty else 0},
+            {"item": "n_all_zero_feature_rows_flagged", "value": int(all_zero_row_report["all_zero_feature_row"].sum())},
+            {"item": "n_all_zero_feature_rows_removed", "value": int(all_zero_row_report["removed_by_all_zero_row_filter"].sum())},
             {"item": "n_missing_feature_values_before_imputation", "value": int(winsorised.isna().sum().sum())},
             {"item": "n_missing_feature_values_after_preprocessing", "value": int(final_features.isna().sum().sum())},
             {"item": "n_missing_indicator_features_added", "value": int(indicators.shape[1])},
@@ -779,6 +908,8 @@ def preprocess_profiles(
             {"item": "max_sample_missing_fraction", "value": max_sample_missing_fraction},
             {"item": "max_absolute_correlation", "value": max_absolute_correlation},
             {"item": "max_zero_fraction", "value": max_zero_fraction},
+            {"item": "remove_all_zero_rows", "value": str(remove_all_zero_rows)},
+            {"item": "all_zero_row_tolerance", "value": all_zero_row_tolerance},
         ]
     )
     return {
@@ -786,6 +917,7 @@ def preprocess_profiles(
         "imputed_unscaled_features_with_metadata": imputed_unscaled,
         "feature_qc": feature_qc,
         "sample_qc": sample_qc,
+        "all_zero_row_report": all_zero_row_report,
         "imputation_report": imputation_report,
         "missingness_indicator_report": indicator_report,
         "metadata_alias_report": metadata_alias_report,

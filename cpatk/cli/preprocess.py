@@ -13,6 +13,7 @@ from cpatk.io import read_table, write_excel_workbook, write_table
 from cpatk.merging import build_profiles_from_folder
 from cpatk.logging_utils import configure_logging
 from cpatk.plotting import (
+    plot_all_zero_row_summary,
     plot_column_role_summary,
     plot_correlation_filter_summary,
     plot_feature_family_summary,
@@ -65,6 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_sample_missing_fraction", type=float, default=0.5)
     parser.add_argument("--max_absolute_correlation", type=float, default=0.95)
     parser.add_argument("--max_zero_fraction", type=float, default=1.0, help="Maximum allowed fraction of exact zero values per feature; 1.0 disables this filter.")
+    parser.add_argument("--disable_all_zero_row_filter", action="store_true", help="Disable removal of rows whose observed retained feature values are all zero. By default this filter runs after all input files have been merged and before imputation.")
+    parser.add_argument("--all_zero_row_tolerance", type=float, default=0.0, help="Absolute tolerance for treating a feature value as zero in the all-zero row filter.")
     parser.add_argument("--disable_correlation_filter", action="store_true")
     parser.add_argument("--disable_metadata_standardisation", action="store_true")
     parser.add_argument("--keep_unnamed_index_columns", action="store_true")
@@ -137,6 +140,11 @@ def _make_preprocessing_plots(*, result: Dict[str, pd.DataFrame], output_dir: Pa
             output_path_base=plot_dir / "top_missing_features_before_imputation",
             logger=logger,
         ),
+        lambda: plot_all_zero_row_summary(
+            all_zero_row_report=result.get("all_zero_row_report", pd.DataFrame()),
+            output_path_base=plot_dir / "all_zero_feature_row_qc",
+            logger=logger,
+        ),
         lambda: plot_correlation_filter_summary(
             correlation_report=result["correlation_filter_report"],
             output_path_base=plot_dir / "correlation_filter_removed_feature_distribution",
@@ -179,6 +187,10 @@ def _write_html_report(
         warnings.append(
             "Missing feature values were present and were imputed. Review the imputation report and missingness plots before interpreting downstream analyses."
         )
+    if int(float(summary_dict.get("n_all_zero_feature_rows_removed", "0"))) > 0:
+        warnings.append(
+            "One or more profiles were removed because all observed retained feature values were zero. This filter is applied only after all CellProfiler tables have been merged and before imputation/correlation filtering."
+        )
     if result["dropped_index_column_report"].get("dropped", pd.Series(dtype=bool)).any():
         warnings.append("One or more likely accidental CSV index columns were dropped before preprocessing.")
     report_path = output_dir / "preprocessing_report.html"
@@ -189,6 +201,7 @@ def _write_html_report(
             "Preprocessing summary": result["preprocessing_summary"],
             "Feature QC": result["feature_qc"],
             "Sample QC": result["sample_qc"],
+            "All-zero row report": result.get("all_zero_row_report", pd.DataFrame()),
             "Imputation report": result["imputation_report"],
             "Non-finite value report": result.get("nonfinite_value_report", pd.DataFrame()),
             "Metadata alias report": result["metadata_alias_report"],
@@ -272,6 +285,8 @@ def main() -> None:
         remove_correlated=not args.disable_correlation_filter,
         max_absolute_correlation=args.max_absolute_correlation,
         max_zero_fraction=args.max_zero_fraction,
+        remove_all_zero_rows=not args.disable_all_zero_row_filter,
+        all_zero_row_tolerance=args.all_zero_row_tolerance,
         imputation_method=args.imputation_method,
         imputation_group_columns=imputation_group_columns,
         add_missing_indicators=args.add_missing_indicators,

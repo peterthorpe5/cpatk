@@ -2,7 +2,7 @@
 
 CPATK is a generic, extensible toolkit for Cell Painting / high-content profiling analysis. It supports defensive preprocessing, QC, classical analysis, optional CLIPn/AI integration, replicate and cluster stability, batch/domain-shift diagnostics, MOA classification, feature attribution and HTML/Excel reporting.
 
-Version: **0.2.4**
+Version: **0.2.5**
 
 ## Design principles
 
@@ -16,7 +16,7 @@ Version: **0.2.4**
 ## Installation
 
 ```bash
-cd cpatk_v0_2_2_full
+cd cpatk_v0_2_5_full
 python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
@@ -47,7 +47,7 @@ cpatk-report
 
 ## Preprocessing
 
-The v0.2.2 preprocessing workflow is intentionally conservative. It writes an auditable column role table, removes obvious technical/provenance columns from default features, imputes missing values, optionally normalises to reference controls, scales features and optionally removes highly correlated features.
+The v0.2.5 preprocessing workflow is intentionally conservative. It writes an auditable column role table, removes obvious technical/provenance columns from default features, imputes missing values, optionally normalises to reference controls, scales features and optionally removes highly correlated features.
 
 Basic preprocessing:
 
@@ -98,6 +98,7 @@ preprocessed.parquet or preprocessed.tsv.gz
 imputed_unscaled_features_with_metadata.tsv
 feature_qc.tsv
 sample_qc.tsv
+all_zero_row_report.tsv
 column_role_report.tsv
 imputation_report.tsv
 reference_normalisation_report.tsv
@@ -112,6 +113,42 @@ preprocessing_report.html
 preprocess.log
 plots/
 ```
+
+
+## v0.2.5 merge-first zero-row preprocessing
+
+The v0.2.5 release adds an explicit all-zero profile filter. This is important for CellProfiler exports where failed images, empty wells or failed object aggregation can produce rows whose retained feature values are all zero. The filter is deliberately applied only after any folder of CellProfiler outputs has been merged into one profile matrix, and before imputation, scaling and correlation filtering. This means a profile is not removed just because one compartment table is zero; it is removed only when the merged retained feature evidence for that profile contains no non-zero observed values.
+
+```bash
+cpatk-preprocess \
+  --input_dir /path/to/cellpainting_exports \
+  --output_dir results/01_preprocess \
+  --recursive \
+  --metadata_table plate_map.tsv \
+  --imputation_method median \
+  --scaling_method robust
+```
+
+The all-zero row filter is enabled by default. It can be disabled for unusual assays where a true biological profile could genuinely be all zero:
+
+```bash
+cpatk-preprocess \
+  --input_table merged_profiles.tsv.gz \
+  --output_dir results/01_preprocess_keep_zero_rows \
+  --disable_all_zero_row_filter
+```
+
+The relevant audit files are:
+
+```text
+all_zero_row_report.tsv
+preprocessing_decision_log.tsv
+preprocessing_summary.tsv
+preprocessing_report.html
+plots/all_zero_feature_row_qc.pdf
+```
+
+Additional v0.2.5 checks include replacing finite values with absolute value greater than 1e10 with missing values before imputation. This follows the defensive behaviour in the older project-specific preprocessing script, where extreme ratio artefacts were not treated as reliable biological morphology.
 
 ## Classical non-AI analysis
 
@@ -223,11 +260,12 @@ See:
 ```text
 docs/CPATK_v0_2_2_critical_evaluation.md
 docs/CPATK_preprocessing_rationale_v0_2_2.md
+docs/CPATK_v0_2_5_merge_first_preprocessing_audit.md
 ```
 
 ## Test status
 
-The v0.2.2 package passed:
+The v0.2.5 package passed module-level tests:
 
 ```text
 Ran 91 tests
@@ -301,3 +339,48 @@ Cluster-number confidence should be assessed with several diagnostics rather tha
 ```bash
 cpatk-stability   --input_table results/01_preprocess/preprocessed.parquet   --output_dir results/04_stability   --metadata_columns Metadata_Plate,Metadata_Well,Metadata_Compound,Metadata_MOA   --replicate_group_columns Metadata_Compound,Metadata_MOA   --n_clusters 8   --k_values 2,3,4,5,6,7,8,9,10   --n_bootstraps 100   --n_permutations 100
 ```
+
+## v0.2.6 update: query-neighbourhood SHAP and feature statistics
+
+CPATK v0.2.6 substantially expands `cpatk-explain`.  In addition to global supervised feature attribution from known classes or MOA labels, it can now explain why a query compound separates from, or resembles, its nearest neighbours.
+
+This was added after reviewing older project-specific SHAP scripts.  The old scripts produced useful query-vs-neighbour SHAP plots and query-vs-background feature statistics, but were tightly coupled to specific column names.  CPATK v0.2.6 generalises those ideas into a reusable module while retaining the outputs that were most useful biologically.
+
+Example query-neighbourhood explanation:
+
+```bash
+cpatk-explain \
+  --input_table results/01_preprocess/preprocessed.parquet \
+  --output_dir results/07_explain \
+  --metadata_columns Metadata_Plate,Metadata_Well,cpd_id,cpd_type,Library,Metadata_MOA \
+  --id_column cpd_id \
+  --query_ids MCP09 \
+  --nn_file results/02_classical/nearest_neighbours.tsv \
+  --n_neighbours 5 \
+  --run_feature_tests \
+  --run_neighbourhood_shap \
+  --background_column cpd_type \
+  --background_values DMSO,control,negative_control \
+  --include_shap \
+  --n_top_features 20 \
+  --log_level INFO
+```
+
+Important outputs include:
+
+```text
+query_neighbourhoods/<query>/selected_neighbours.tsv
+query_neighbourhoods/<query>/query_vs_background_feature_statistics.tsv
+query_neighbourhoods/<query>/top_query_increased_features.tsv
+query_neighbourhoods/<query>/top_query_decreased_features.tsv
+query_neighbourhoods/<query>/top_shap_features_driving_query_difference.tsv
+query_neighbourhoods/<query>/low_contribution_shap_features.tsv
+query_neighbourhoods/<query>/sample_feature_shap_values.tsv.gz
+query_neighbourhoods/<query>/neighbourhood_shap_status.tsv
+query_neighbourhoods/<query>/top_shap_feature_family_summary.tsv
+query_neighbourhoods/<query>/query_neighbourhood_explanation_summary.xlsx
+feature_explanation_report.html
+feature_explanation_summary.xlsx
+```
+
+Interpretation: the feature-statistics tables describe direct query-vs-background differences using median differences, Wasserstein distances, Mann-Whitney or Kolmogorov-Smirnov tests and BH-FDR correction.  The SHAP tables and plots explain the fitted local query-vs-neighbour classifier.  They are useful for biological hypothesis generation, but they do not prove causality.
