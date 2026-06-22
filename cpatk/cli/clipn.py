@@ -10,6 +10,7 @@ from cpatk.clipn_adapter import (
     load_clipn_datasets,
     read_datasets_manifest,
     run_clipn_workflow,
+    split_single_dataset_by_group,
 )
 from cpatk.features import parse_column_list
 from cpatk.io import read_table
@@ -96,6 +97,44 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--save_model", default=None, help="Optional pickle path for fitted backend model.")
+    parser.add_argument(
+        "--split_single_dataset_by_column",
+        default=None,
+        help=(
+            "If exactly one dataset is supplied, split it into two CLIPn datasets by this "
+            "grouping column, usually cpd_id or Metadata_Compound. Compound groups are not split."
+        ),
+    )
+    parser.add_argument(
+        "--single_dataset_split_names",
+        default="split_a,split_b",
+        help="Comma-separated names for --split_single_dataset_by_column output datasets.",
+    )
+    parser.add_argument(
+        "--single_dataset_split_seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible single-dataset splitting.",
+    )
+    parser.add_argument(
+        "--drop_rows_with_any_zero",
+        action="store_true",
+        help=(
+            "Strict CLIPn option: drop any row containing at least one literal zero after "
+            "missingness filtering. This is usually too aggressive; all-zero rows/features "
+            "are removed by default."
+        ),
+    )
+    parser.add_argument(
+        "--keep_all_zero_rows",
+        action="store_true",
+        help="Do not remove all-zero CLIPn rows. Not recommended.",
+    )
+    parser.add_argument(
+        "--keep_all_zero_features",
+        action="store_true",
+        help="Do not remove all-zero CLIPn features. Not recommended.",
+    )
     parser.add_argument("--log_level", default="INFO")
     return parser
 
@@ -140,8 +179,28 @@ def main() -> None:
     logger.info("Arguments: %s", vars(args))
     dataset_paths = _dataset_paths_from_args(args, logger)
     datasets, alias_report = load_clipn_datasets(dataset_paths=dataset_paths, logger=logger)
+    split_report = None
+    if len(datasets) == 1 and args.split_single_dataset_by_column:
+        original_name = next(iter(datasets))
+        split_names = parse_column_list(value=args.single_dataset_split_names) or ["split_a", "split_b"]
+        if len(split_names) != 2:
+            raise ValueError("--single_dataset_split_names must provide exactly two names.")
+        datasets, split_report = split_single_dataset_by_group(
+            data_frame=datasets[original_name],
+            group_column=args.split_single_dataset_by_column,
+            random_state=args.single_dataset_split_seed,
+            split_names=(split_names[0], split_names[1]),
+        )
+        logger.info(
+            "Split single CLIPn dataset '%s' into %s using group column '%s'.",
+            original_name,
+            ",".join(split_names),
+            args.split_single_dataset_by_column,
+        )
     if not alias_report.empty:
         alias_report.to_csv(output_dir / "clipn_metadata_alias_report.tsv", sep="\t", index=False)
+    if split_report is not None:
+        split_report.to_csv(output_dir / "clipn_single_dataset_split_report.tsv", sep="\t", index=False)
     config = ClipnAdapterConfig(
         backend_module=args.backend_module,
         model_class=args.model_class,
@@ -165,6 +224,9 @@ def main() -> None:
         normalise_latent=not args.disable_latent_l2_normalisation,
         n_neighbours=args.n_neighbours,
         distance_metric=args.distance_metric,
+        remove_all_zero_rows=not args.keep_all_zero_rows,
+        remove_all_zero_features=not args.keep_all_zero_features,
+        drop_rows_with_any_zero=args.drop_rows_with_any_zero,
         allow_pca_fallback=args.allow_pca_fallback,
     )
     run_clipn_workflow(

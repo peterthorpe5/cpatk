@@ -76,23 +76,34 @@ def run_umap_or_pca(
     pandas.DataFrame
         Embedding table.
     """
-    try:
-        import umap  # type: ignore
-
-        reducer = umap.UMAP(
-            n_components=n_components,
-            n_neighbors=n_neighbors,
-            min_dist=min_dist,
-            random_state=random_state,
-        )
-        values = reducer.fit_transform(X=features)
-        prefix = "UMAP"
-    except Exception as exc:  # pragma: no cover - depends on optional dependency
+    if features.shape[0] <= n_neighbors:
         if logger is not None:
-            logger.warning("UMAP unavailable, falling back to PCA: %s", exc)
+            logger.warning(
+                "UMAP skipped because n_rows=%s is not greater than n_neighbors=%s; falling back to PCA.",
+                features.shape[0],
+                n_neighbors,
+            )
         scores, _ = run_pca(features=features, n_components=n_components, random_state=random_state)
         values = scores.to_numpy()
         prefix = "PCA_fallback"
+    else:
+        try:
+            import umap  # type: ignore
+
+            reducer = umap.UMAP(
+                n_components=n_components,
+                n_neighbors=n_neighbors,
+                min_dist=min_dist,
+                random_state=random_state,
+            )
+            values = reducer.fit_transform(X=features)
+            prefix = "UMAP"
+        except Exception as exc:  # pragma: no cover - depends on optional dependency
+            if logger is not None:
+                logger.warning("UMAP unavailable, falling back to PCA: %s", exc)
+            scores, _ = run_pca(features=features, n_components=n_components, random_state=random_state)
+            values = scores.to_numpy()
+            prefix = "PCA_fallback"
     columns = [f"{prefix}{index + 1}" for index in range(values.shape[1])]
     return pd.DataFrame(data=values, columns=columns, index=features.index)
 

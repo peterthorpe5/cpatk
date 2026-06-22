@@ -305,7 +305,22 @@ def impute_features(
     elif method == "knn":
         if n_neighbors < 1:
             raise ValueError("n_neighbors must be at least 1 for KNN imputation.")
-        imputer = KNNImputer(n_neighbors=n_neighbors)
+        if features.shape[0] < 2:
+            if logger is not None:
+                logger.warning(
+                    "KNN imputation requested for fewer than two rows; using median imputation instead."
+                )
+            imputer = SimpleImputer(strategy="median")
+        else:
+            effective_neighbors = min(int(n_neighbors), max(1, features.shape[0] - 1))
+            if effective_neighbors != n_neighbors and logger is not None:
+                logger.warning(
+                    "Capped KNN n_neighbors from %s to %s for %s rows.",
+                    n_neighbors,
+                    effective_neighbors,
+                    features.shape[0],
+                )
+            imputer = KNNImputer(n_neighbors=effective_neighbors)
     else:
         raise ValueError(f"Unsupported imputation method: {method}")
 
@@ -429,7 +444,7 @@ def normalise_features_to_reference(
                     "feature": feature,
                     "status": status,
                     "reference_column": reference_column,
-                    "reference_values": ",".join(sorted(ref_values)),
+                    "reference_values": ";".join(sorted(ref_values)),
                     "n_reference_profiles": int(group_ref_mask.sum()),
                     "centre": float(centre) if pd.notna(centre) else np.nan,
                     "scale": float(scale),
@@ -517,6 +532,7 @@ def remove_correlated_features(
     *,
     features: pd.DataFrame,
     max_absolute_correlation: float = 0.95,
+    max_features_for_correlation: int = 5000,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Remove one feature from each highly correlated pair.
@@ -525,8 +541,35 @@ def remove_correlated_features(
     removed.  This is more defensible than removing whichever feature happens to
     appear later in the table.
     """
+    report_columns = [
+        "status",
+        "removed_feature",
+        "retained_feature",
+        "correlation",
+        "n_features",
+        "max_features_for_correlation",
+    ]
     if features.shape[1] <= 1:
-        return features.copy(), pd.DataFrame(columns=["removed_feature", "retained_feature", "correlation"])
+        return features.copy(), pd.DataFrame(columns=report_columns)
+    if features.shape[1] > max_features_for_correlation:
+        if logger is not None:
+            logger.warning(
+                "Skipping full correlation filtering for %s features because this exceeds max_features_for_correlation=%s.",
+                features.shape[1],
+                max_features_for_correlation,
+            )
+        return features.copy(), pd.DataFrame.from_records(
+            [
+                {
+                    "status": "skipped_too_many_features",
+                    "removed_feature": "",
+                    "retained_feature": "",
+                    "correlation": np.nan,
+                    "n_features": int(features.shape[1]),
+                    "max_features_for_correlation": int(max_features_for_correlation),
+                }
+            ]
+        )
     correlation = features.corr(method="pearson").abs()
     variances = features.var(axis=0, skipna=True).fillna(0)
     missing = features.isna().mean(axis=0)
@@ -551,9 +594,12 @@ def remove_correlated_features(
             to_remove.add(removed)
             records.append(
                 {
+                    "status": "removed",
                     "removed_feature": removed,
                     "retained_feature": retained,
                     "correlation": float(corr_value),
+                    "n_features": int(features.shape[1]),
+                    "max_features_for_correlation": int(max_features_for_correlation),
                     "removed_missing_fraction": float(missing[removed]),
                     "retained_missing_fraction": float(missing[retained]),
                     "removed_variance": float(variances[removed]),
@@ -566,6 +612,64 @@ def remove_correlated_features(
         logger.info("Removed %s highly correlated features", len(to_remove))
     retained_columns = [column for column in columns if column not in to_remove]
     return features.loc[:, retained_columns].copy(), pd.DataFrame.from_records(records)
+
+
+
+def validate_final_feature_matrix(
+    *,
+    features: pd.DataFrame,
+    context: str = "final feature matrix",
+) -> pd.DataFrame:
+    """Validate that a downstream feature matrix is finite and non-empty.
+
+    Parameters
+    ----------
+    features:
+        Numeric feature matrix to validate.
+    context:
+        Human-readable label used in error messages.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One-row validation report.
+
+    Raises
+    ------
+    ValueError
+        If the matrix has no rows, no columns, missing values or non-finite
+        values.
+    """
+    if features.shape[0] == 0:
+        raise ValueError(f"{context} has no rows after preprocessing.")
+    if features.shape[1] == 0:
+        raise ValueError(f"{context} has no feature columns after preprocessing.")
+    numeric = features.apply(pd.to_numeric, errors="coerce")
+    values = numeric.to_numpy(dtype=float)
+    n_nan = int(np.isnan(values).sum())
+    n_pos_inf = int(np.isposinf(values).sum())
+    n_neg_inf = int(np.isneginf(values).sum())
+    n_nonfinite = int((~np.isfinite(values)).sum())
+    report = pd.DataFrame.from_records(
+        [
+            {
+                "context": context,
+                "n_rows": int(features.shape[0]),
+                "n_features": int(features.shape[1]),
+                "n_nan": n_nan,
+                "n_positive_infinity": n_pos_inf,
+                "n_negative_infinity": n_neg_inf,
+                "n_nonfinite": n_nonfinite,
+                "status": "ok" if n_nonfinite == 0 else "failed",
+            }
+        ]
+    )
+    if n_nonfinite:
+        raise ValueError(
+            f"{context} contains {n_nonfinite} non-finite values "
+            f"({n_nan} NaN, {n_pos_inf} +inf, {n_neg_inf} -inf)."
+        )
+    return report
 
 
 def aggregate_profiles(
@@ -661,9 +765,11 @@ def preprocess_profiles(
     all_zero_row_tolerance: float = 0.0,
     remove_correlated: bool = True,
     max_absolute_correlation: float = 0.95,
+    max_features_for_correlation: int = 5000,
     imputation_method: str = "median",
     imputation_group_columns: Optional[Sequence[str]] = None,
     add_missing_indicators: bool = False,
+    include_missing_indicators_in_correlation_filter: bool = False,
     max_missing_indicators: int = 500,
     minimum_missing_indicator_fraction: float = 0.0,
     scaling_method: str = "robust",
@@ -733,6 +839,17 @@ def preprocess_profiles(
             "No feature columns were detected. Supply --feature_columns explicitly, "
             "or review whether the input table is metadata-only or already reduced to non-CellProfiler measurements."
         )
+
+    sample_qc_before_feature_qc = calculate_sample_qc(
+        features=features,
+        metadata=metadata.reset_index(drop=True),
+    )
+    _decision_log(
+        decisions,
+        "sample_qc_before_feature_qc",
+        "Calculated profile/sample QC before feature-level filtering",
+        n_rows=int(sample_qc_before_feature_qc.shape[0]),
+    )
 
     features, nonfinite_report = replace_nonfinite_with_nan(features=features, logger=logger)
     _decision_log(
@@ -804,28 +921,8 @@ def preprocess_profiles(
     if not winsorisation_report.empty:
         _decision_log(decisions, "winsorisation", "Clipped extreme values to requested quantiles", n_features=int(winsorisation_report.shape[0]))
 
-    imputed = impute_features(
+    normalised_for_imputation, reference_normalisation_report = normalise_features_to_reference(
         features=winsorised,
-        method=imputation_method,
-        metadata=selected_metadata,
-        group_columns=imputation_group_columns,
-        logger=logger,
-    )
-    imputation_report = summarise_imputation(before=winsorised, after=imputed, method=imputation_method)
-    _decision_log(decisions, "imputation", "Imputed remaining missing feature values", method=imputation_method, n_missing_before=int(winsorised.isna().sum().sum()), n_missing_after=int(imputed.isna().sum().sum()))
-
-    indicators, indicator_report = add_missingness_indicators(
-        features=winsorised,
-        max_indicators=max_missing_indicators,
-        minimum_missing_fraction=minimum_missing_indicator_fraction,
-        logger=logger,
-    ) if add_missing_indicators else (
-        pd.DataFrame(index=winsorised.index),
-        pd.DataFrame(columns=["source_feature", "indicator_feature", "missing_fraction"]),
-    )
-
-    normalised, reference_normalisation_report = normalise_features_to_reference(
-        features=imputed,
         metadata=selected_metadata,
         reference_column=reference_column,
         reference_values=reference_values,
@@ -834,10 +931,45 @@ def preprocess_profiles(
         logger=logger,
     )
     if reference_normalisation_method.lower() != "none":
-        _decision_log(decisions, "reference_normalisation", "Normalised features to reference/control profiles", method=reference_normalisation_method)
+        _decision_log(
+            decisions,
+            "reference_normalisation",
+            "Normalised features to reference/control profiles before imputation so control statistics are not biased by imputed values",
+            method=reference_normalisation_method,
+        )
+
+    indicators, indicator_report = add_missingness_indicators(
+        features=normalised_for_imputation,
+        max_indicators=max_missing_indicators,
+        minimum_missing_fraction=minimum_missing_indicator_fraction,
+        logger=logger,
+    ) if add_missing_indicators else (
+        pd.DataFrame(index=normalised_for_imputation.index),
+        pd.DataFrame(columns=["source_feature", "indicator_feature", "missing_fraction"]),
+    )
+    if not indicator_report.empty:
+        indicator_report["feature_role"] = "missingness_indicator"
+        indicator_report["included_in_correlation_filter"] = bool(include_missing_indicators_in_correlation_filter)
+
+    imputed = impute_features(
+        features=normalised_for_imputation,
+        method=imputation_method,
+        metadata=selected_metadata,
+        group_columns=imputation_group_columns,
+        logger=logger,
+    )
+    imputation_report = summarise_imputation(before=normalised_for_imputation, after=imputed, method=imputation_method)
+    _decision_log(
+        decisions,
+        "imputation",
+        "Imputed remaining missing feature values after optional reference normalisation",
+        method=imputation_method,
+        n_missing_before=int(normalised_for_imputation.isna().sum().sum()),
+        n_missing_after=int(imputed.isna().sum().sum()),
+    )
 
     batch_centered, batch_centering_report = batch_center_features(
-        features=normalised,
+        features=imputed,
         metadata=selected_metadata,
         batch_columns=batch_centering_columns,
         method=batch_centering_method,
@@ -846,24 +978,58 @@ def preprocess_profiles(
     if batch_centering_method.lower() != "none":
         _decision_log(decisions, "batch_centering", "Applied optional batch centering", method=batch_centering_method)
 
-    with_indicators = pd.concat([batch_centered.reset_index(drop=True), indicators.reset_index(drop=True)], axis=1)
-    scaled = scale_features(features=with_indicators, method=scaling_method, logger=logger)
-    _decision_log(decisions, "scaling", "Scaled features", method=scaling_method)
+    scaled_biological = scale_features(features=batch_centered, method=scaling_method, logger=logger)
+    _decision_log(decisions, "scaling", "Scaled biological Cell Painting features", method=scaling_method)
+
+    if include_missing_indicators_in_correlation_filter:
+        features_for_correlation = pd.concat(
+            [scaled_biological.reset_index(drop=True), indicators.reset_index(drop=True)],
+            axis=1,
+        )
+    else:
+        features_for_correlation = scaled_biological.copy()
 
     if remove_correlated:
-        final_features, correlation_report = remove_correlated_features(
-            features=scaled,
+        filtered_features, correlation_report = remove_correlated_features(
+            features=features_for_correlation,
             max_absolute_correlation=max_absolute_correlation,
+            max_features_for_correlation=max_features_for_correlation,
             logger=logger,
         )
-        _decision_log(decisions, "correlation_filter", "Removed redundant highly correlated features", n_removed=int(correlation_report.shape[0]))
+        n_removed_corr = int((correlation_report.get("status", pd.Series(dtype=str)) == "removed").sum())
+        _decision_log(
+            decisions,
+            "correlation_filter",
+            "Removed redundant highly correlated biological features",
+            n_removed=n_removed_corr,
+        )
     else:
-        final_features = scaled.copy()
-        correlation_report = pd.DataFrame(columns=["removed_feature", "retained_feature", "correlation"])
+        filtered_features = features_for_correlation.copy()
+        correlation_report = pd.DataFrame(columns=["status", "removed_feature", "retained_feature", "correlation"])
 
+    if include_missing_indicators_in_correlation_filter:
+        final_features = filtered_features.copy()
+    else:
+        final_features = pd.concat(
+            [filtered_features.reset_index(drop=True), indicators.reset_index(drop=True)],
+            axis=1,
+        )
+
+    final_matrix_validation = validate_final_feature_matrix(
+        features=final_features,
+        context="preprocessed feature matrix",
+    )
     preprocessed = pd.concat([selected_metadata.reset_index(drop=True), final_features.reset_index(drop=True)], axis=1)
     imputed_unscaled = pd.concat([selected_metadata.reset_index(drop=True), imputed.reset_index(drop=True)], axis=1)
-    retained_features = pd.DataFrame({"feature": final_features.columns.tolist()})
+    retained_features = pd.DataFrame(
+        {
+            "feature": final_features.columns.tolist(),
+            "feature_role": [
+                "missingness_indicator" if str(feature).startswith("MissingIndicator__") else "biological_feature"
+                for feature in final_features.columns
+            ],
+        }
+    )
     feature_family_summary = summarise_feature_families(feature_names=final_features.columns.tolist())
 
     config = pd.DataFrame.from_records(
@@ -877,9 +1043,11 @@ def preprocess_profiles(
             {"parameter": "all_zero_row_tolerance", "value": str(all_zero_row_tolerance)},
             {"parameter": "reference_normalisation_method", "value": reference_normalisation_method},
             {"parameter": "reference_column", "value": str(reference_column)},
-            {"parameter": "reference_values", "value": ",".join(reference_values or [])},
+            {"parameter": "reference_values", "value": ";".join(reference_values or [])},
             {"parameter": "batch_centering_method", "value": batch_centering_method},
+            {"parameter": "max_features_for_correlation", "value": str(max_features_for_correlation)},
             {"parameter": "include_qc_numeric_features", "value": str(include_qc_numeric_features)},
+            {"parameter": "include_missing_indicators_in_correlation_filter", "value": str(include_missing_indicators_in_correlation_filter)},
         ]
     )
     summary = pd.DataFrame.from_records(
@@ -897,10 +1065,10 @@ def preprocess_profiles(
             {"item": "n_missing_feature_values_after_preprocessing", "value": int(final_features.isna().sum().sum())},
             {"item": "n_missing_indicator_features_added", "value": int(indicators.shape[1])},
             {"item": "n_features_after_correlation_filter", "value": int(len(final_features.columns))},
-            {"item": "n_correlated_features_removed", "value": int(correlation_report.shape[0])},
+            {"item": "n_correlated_features_removed", "value": int((correlation_report.get("status", pd.Series(dtype=str)) == "removed").sum())},
             {"item": "n_excluded_numeric_qc_or_provenance_columns", "value": int((column_role_report["role"] == "excluded_numeric_qc_or_provenance").sum())},
             {"item": "imputation_method", "value": imputation_method},
-            {"item": "imputation_group_columns", "value": ",".join(imputation_group_columns or [])},
+            {"item": "imputation_group_columns", "value": ";".join(imputation_group_columns or [])},
             {"item": "scaling_method", "value": scaling_method},
             {"item": "reference_normalisation_method", "value": reference_normalisation_method},
             {"item": "batch_centering_method", "value": batch_centering_method},
@@ -916,6 +1084,8 @@ def preprocess_profiles(
         "preprocessed": preprocessed,
         "imputed_unscaled_features_with_metadata": imputed_unscaled,
         "feature_qc": feature_qc,
+        "sample_qc_before_feature_qc": sample_qc_before_feature_qc,
+        "sample_qc_after_feature_qc": sample_qc,
         "sample_qc": sample_qc,
         "all_zero_row_report": all_zero_row_report,
         "imputation_report": imputation_report,
@@ -929,6 +1099,7 @@ def preprocess_profiles(
         "reference_normalisation_report": reference_normalisation_report,
         "batch_centering_report": batch_centering_report,
         "correlation_filter_report": correlation_report,
+        "final_matrix_validation": final_matrix_validation,
         "retained_features": retained_features,
         "feature_family_summary": feature_family_summary,
         "preprocessing_config": config,

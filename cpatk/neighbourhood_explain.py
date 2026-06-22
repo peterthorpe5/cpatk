@@ -257,7 +257,12 @@ def calculate_two_sample_feature_statistics(
             emd = float(wasserstein_distance(a, b))
             if test == "mw":
                 try:
-                    p_value = float(mannwhitneyu(a, b, alternative="two-sided").pvalue)
+                    try:
+                        p_value = float(
+                            mannwhitneyu(a, b, alternative="two-sided", method="asymptotic").pvalue
+                        )
+                    except TypeError:
+                        p_value = float(mannwhitneyu(a, b, alternative="two-sided").pvalue)
                 except Exception:
                     p_value = 1.0
             else:
@@ -376,18 +381,6 @@ def calculate_neighbourhood_shap(
     optional; failures are captured in the status table rather than crashing a
     complete CPATK run.
     """
-    try:
-        import shap  # type: ignore
-    except Exception as exc:  # pragma: no cover - optional dependency
-        return {
-            "top_features": pd.DataFrame(columns=["feature", "mean_absolute_shap"]),
-            "low_contribution_features": pd.DataFrame(columns=["feature", "mean_absolute_shap"]),
-            "sample_feature_shap_values": pd.DataFrame(),
-            "status": pd.DataFrame.from_records([{"status": "not_available", "message": str(exc)}]),
-            "model": None,
-            "shap_array": np.empty((0, 0)),
-            "explained_x": pd.DataFrame(),
-        }
     clean_x = x.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
     clean_x = clean_x.fillna(clean_x.median(axis=0, skipna=True)).fillna(0.0).astype(float)
     clean_y = y.astype(int).reset_index(drop=True)
@@ -402,6 +395,74 @@ def calculate_neighbourhood_shap(
     explain_indices = np.sort(rng.choice(np.arange(clean_x.shape[0]), size=explain_n, replace=False))
     background_x = clean_x.iloc[background_indices, :]
     explain_x = clean_x.iloc[explain_indices, :]
+
+    # Small neighbourhood comparisons are common in CPATK unit tests and in
+    # exploratory query-vs-neighbour checks. Some SHAP versions can be slow to
+    # initialise even for tiny linear models, so use a deterministic linear
+    # contribution calculation for very small logistic-regression problems.
+    # This keeps tests and reports reliable while preserving full SHAP for
+    # larger analyses.
+    if isinstance(model, LogisticRegression) and clean_x.shape[0] <= 20 and clean_x.shape[1] <= 50:
+        coefficients = np.ravel(model.coef_)
+        centred = explain_x - background_x.mean(axis=0)
+        shap_array = centred.to_numpy(dtype=float) * coefficients.reshape(1, -1)
+        mean_abs = np.mean(np.abs(shap_array), axis=0)
+        ranking = np.argsort(mean_abs)[::-1]
+        low_ranking = np.argsort(mean_abs)
+        top_n = min(max(1, int(n_top_features)), clean_x.shape[1])
+        top = pd.DataFrame(
+            {
+                "feature": clean_x.columns[ranking[:top_n]],
+                "mean_absolute_shap": mean_abs[ranking[:top_n]],
+                "importance_rank": np.arange(1, top_n + 1),
+            }
+        )
+        low = pd.DataFrame(
+            {
+                "feature": clean_x.columns[low_ranking[:top_n]],
+                "mean_absolute_shap": mean_abs[low_ranking[:top_n]],
+                "low_contribution_rank": np.arange(1, top_n + 1),
+            }
+        )
+        shap_value_table = pd.DataFrame(shap_array, columns=clean_x.columns)
+        shap_value_table.insert(0, "explained_row_position", explain_indices)
+        status = pd.DataFrame.from_records(
+            [
+                {
+                    "status": "ok",
+                    "query_id": query_id,
+                    "model_type": type(model).__name__,
+                    "n_profiles": int(clean_x.shape[0]),
+                    "n_features": int(clean_x.shape[1]),
+                    "n_background": int(background_x.shape[0]),
+                    "n_explained": int(explain_x.shape[0]),
+                    "message": "Linear contribution fallback completed for a small neighbourhood model.",
+                }
+            ]
+        )
+        return {
+            "top_features": top,
+            "low_contribution_features": low,
+            "sample_feature_shap_values": shap_value_table,
+            "status": status,
+            "model": model,
+            "shap_array": shap_array,
+            "explained_x": explain_x,
+        }
+
+    try:
+        import shap  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency
+        return {
+            "top_features": pd.DataFrame(columns=["feature", "mean_absolute_shap"]),
+            "low_contribution_features": pd.DataFrame(columns=["feature", "mean_absolute_shap"]),
+            "sample_feature_shap_values": pd.DataFrame(),
+            "status": pd.DataFrame.from_records([{"status": "not_available", "message": str(exc)}]),
+            "model": model,
+            "shap_array": np.empty((0, 0)),
+            "explained_x": pd.DataFrame(),
+        }
+
     try:
         if isinstance(model, RandomForestClassifier):
             try:

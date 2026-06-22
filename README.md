@@ -2,7 +2,7 @@
 
 CPATK is a generic, extensible toolkit for Cell Painting / high-content profiling analysis. It supports defensive preprocessing, QC, classical analysis, optional CLIPn/AI integration, replicate and cluster stability, batch/domain-shift diagnostics, MOA classification, feature attribution and HTML/Excel reporting.
 
-Version: **0.2.5**
+Version: **0.2.11**
 
 ## Design principles
 
@@ -16,9 +16,10 @@ Version: **0.2.5**
 ## Installation
 
 ```bash
-cd cpatk_v0_2_5_full
+cd cpatk_v0_2_11_full
 python -m pip install -e .
-python -m unittest discover -s tests -v
+env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
+  python -m unittest discover -s tests -v
 ```
 
 Optional dependencies:
@@ -29,10 +30,51 @@ python -m pip install pyarrow plotly umap-learn shap
 
 `pyarrow` enables Parquet output. Without it, CPATK falls back to `.tsv.gz` and logs the reason.
 
+## v0.2.11 release-hardening update
+
+This release is focused on making CPATK safer for production and publication workflows rather than adding a new analysis method. Key changes are:
+
+- Added `cpatk-metadata` as a step-one metadata and annotation validation workflow.
+- Canonicalises messy assay and source well metadata, including `A1`/`A01` formats, while preserving raw values in `__raw` audit columns.
+- Requires explicit assay plate/well columns when metadata are ambiguous; source/robot plate-well columns are never promoted to the CellProfiler assay keys.
+- Supports strict annotation merging with duplicate-key reports.
+- Fails by default on dangerous duplicate image rows or metadata merge keys.
+- Fixes copied interactive HTML report links so they point into `report_assets/`.
+- Returns a real visualisation output manifest from `cpatk-visualise`.
+- Calculates sample/profile QC both before and after feature-level QC.
+- Applies reference/control normalisation before imputation.
+- Caps KNN imputation neighbours for small datasets.
+- Separates missingness-indicator features from biological correlation filtering by default.
+- Adds final feature-matrix validation for empty, NaN or infinite outputs.
+- Adds a memory guard for full correlation filtering on very wide matrices.
+- Hardens CLIPn inputs by requiring at least two non-empty datasets, adding a compound-preserving single-table split helper, and removing all-zero rows/features before CLIPn fitting.
+
+Recommended first metadata check:
+
+```bash
+cpatk-metadata \
+  --metadata_table raw_metadata.csv \
+  --output_dir results/00_metadata_check \
+  --plate_column Assay_Plate_Barcode \
+  --well_column Destination_Well \
+  --source_plate_column Source_Plate_Barcode \
+  --source_well_column Source_Well \
+  --annotation_tables annotation_file.csv,compound_library.tsv \
+  --annotation_source_plate_column Barcode \
+  --annotation_source_well_column Well \
+  --merge_keys Metadata_Source_Plate,Metadata_Source_Well \
+  --duplicate_policy error \
+  --log_level INFO
+```
+
+The main output from this step is `formatted_metadata.tsv`, which should be used as the safer metadata input for later CPATK steps.
+
 ## Command-line tools
 
 ```text
+cpatk-metadata
 cpatk-inspect
+cpatk-build-profiles
 cpatk-preprocess
 cpatk-classical
 cpatk-layout
@@ -42,6 +84,9 @@ cpatk-ml
 cpatk-explain
 cpatk-clipn
 cpatk-moa
+cpatk-visualise
+cpatk-drift-qc
+cpatk-neighbours
 cpatk-report
 ```
 

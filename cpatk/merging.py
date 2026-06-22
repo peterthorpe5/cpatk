@@ -287,18 +287,82 @@ def _aggregate_object_table(
     return aggregated, report
 
 
+
+def _collapse_duplicate_rows(
+    *,
+    data_frame: pd.DataFrame,
+    keys: Sequence[str],
+    duplicate_policy: str,
+    context: str,
+) -> pd.DataFrame:
+    """Collapse duplicate key rows only when explicitly allowed.
+
+    Parameters
+    ----------
+    data_frame:
+        Table to inspect.
+    keys:
+        Key columns that should be unique.
+    duplicate_policy:
+        One of ``error``, ``identical`` or ``first``.
+    context:
+        Human-readable context for error messages.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Table with duplicate keys resolved according to policy.
+    """
+    duplicate_policy = duplicate_policy.lower()
+    if duplicate_policy not in {"error", "identical", "first"}:
+        raise ValueError("duplicate_policy must be one of: error, identical, first.")
+    keys = list(keys)
+    duplicated = data_frame.duplicated(subset=keys, keep=False)
+    if not duplicated.any():
+        return data_frame.copy()
+    if duplicate_policy == "error":
+        preview = data_frame.loc[duplicated, keys].head(10).to_dict(orient="records")
+        raise ValueError(
+            f"Duplicate {context} keys were found for {keys}. Preview: {preview}. "
+            "Fix the input table or rerun with duplicate_policy='identical' or 'first'."
+        )
+    if duplicate_policy == "first":
+        return data_frame.drop_duplicates(subset=keys, keep="first").copy()
+    non_key_columns = [column for column in data_frame.columns if column not in keys]
+    problem_keys = []
+    for key_values, block in data_frame.loc[duplicated].groupby(keys, dropna=False):
+        conflicting = [
+            column for column in non_key_columns
+            if block[column].dropna().astype(str).nunique() > 1
+        ]
+        if conflicting:
+            problem_keys.append((key_values, conflicting[:5]))
+    if problem_keys:
+        raise ValueError(
+            f"Duplicate {context} keys were not identical. Preview: {problem_keys[:5]}. "
+            "Use duplicate_policy='first' only after reviewing the duplicate-key report."
+        )
+    return data_frame.drop_duplicates(subset=keys, keep="first").copy()
+
+
 def _prepare_image_or_profile_table(
     *,
     data_frame: pd.DataFrame,
     table_label: str,
     include_qc_numeric_features: bool = False,
+    duplicate_image_policy: str = "error",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Prepare an image-level/profile table without object aggregation."""
     n_rows_input = int(data_frame.shape[0])
     n_duplicate_image_rows = 0
     if "ImageNumber" in data_frame.columns:
         n_duplicate_image_rows = int(data_frame.duplicated(subset=["ImageNumber"], keep=False).sum())
-        data_frame = data_frame.drop_duplicates(subset=["ImageNumber"]).copy()
+        data_frame = _collapse_duplicate_rows(
+            data_frame=data_frame,
+            keys=["ImageNumber"],
+            duplicate_policy=duplicate_image_policy,
+            context="ImageNumber",
+        )
     report = pd.DataFrame.from_records(
         [
             {
@@ -310,7 +374,8 @@ def _prepare_image_or_profile_table(
                 "contains_ImageNumber": bool("ImageNumber" in data_frame.columns),
                 "contains_Metadata_Plate": bool("Metadata_Plate" in data_frame.columns),
                 "contains_Metadata_Well": bool("Metadata_Well" in data_frame.columns),
-                "note": "Image/profile table used as profile backbone. Duplicate ImageNumber rows are reported if present.",
+                "duplicate_image_policy": duplicate_image_policy,
+                "note": "Image/profile table used as profile backbone. Duplicate ImageNumber rows fail by default unless an explicit permissive policy is chosen.",
             }
         ]
     )
@@ -348,6 +413,7 @@ def _merge_external_metadata(
     profiles: pd.DataFrame,
     metadata: pd.DataFrame,
     metadata_label: str,
+    metadata_duplicate_policy: str = "error",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Merge external metadata onto profiles using canonical keys."""
     profiles, _, _, _, _ = _coerce_and_clean_table(data_frame=profiles)
@@ -373,7 +439,12 @@ def _merge_external_metadata(
         )
         return profiles, report
     duplicated = metadata.duplicated(subset=keys, keep=False)
-    metadata_unique = metadata.drop_duplicates(subset=keys, keep="first").copy()
+    metadata_unique = _collapse_duplicate_rows(
+        data_frame=metadata,
+        keys=keys,
+        duplicate_policy=metadata_duplicate_policy,
+        context=f"metadata table {metadata_label}",
+    )
     before = profiles.shape[0]
     metadata_columns_to_add = [column for column in metadata_unique.columns if column not in keys and column not in profiles.columns]
     merged = profiles.merge(
@@ -388,12 +459,13 @@ def _merge_external_metadata(
             {
                 "metadata_label": metadata_label,
                 "status": "merged",
-                "merge_keys": ",".join(keys),
+                "merge_keys": ";".join(keys),
                 "reason": "Merged external metadata using canonical keys.",
                 "n_profiles_before": int(before),
                 "n_profiles_after": int(merged.shape[0]),
                 "n_metadata_rows": int(metadata.shape[0]),
                 "n_metadata_duplicate_key_rows": int(duplicated.sum()),
+                "metadata_duplicate_policy": metadata_duplicate_policy,
                 "n_metadata_columns_added": int(len(metadata_columns_to_add)),
                 "n_unmatched_profiles": unmatched,
             }
@@ -412,6 +484,8 @@ def build_profiles_from_folder(
     metadata_table: Optional[str] = None,
     aggregate_statistic: str = "median",
     include_qc_numeric_features: bool = False,
+    duplicate_image_policy: str = "error",
+    metadata_duplicate_policy: str = "error",
     logger: Optional[logging.Logger] = None,
 ) -> ProfileBuildResult:
     """Build an analysis-ready profile table from a folder of Cell Painting files.
@@ -435,6 +509,10 @@ def build_profiles_from_folder(
         Object aggregation statistic, ``median`` or ``mean``.
     include_qc_numeric_features:
         Whether count/QC columns can be aggregated as features.
+    duplicate_image_policy:
+        Policy for duplicate ImageNumber rows in the backbone table: error, identical or first.
+    metadata_duplicate_policy:
+        Policy for duplicate external metadata keys: error, identical or first.
     logger:
         Optional logger.
 
@@ -472,6 +550,7 @@ def build_profiles_from_folder(
         data_frame=backbone_clean,
         table_label=_normalise_file_label(backbone_path),
         include_qc_numeric_features=include_qc_numeric_features,
+        duplicate_image_policy=duplicate_image_policy,
     )
 
     aggregation_reports: List[pd.DataFrame] = []
@@ -515,6 +594,7 @@ def build_profiles_from_folder(
             profiles=profiles,
             metadata=metadata_raw,
             metadata_label=_normalise_file_label(metadata_path),
+            metadata_duplicate_policy=metadata_duplicate_policy,
         )
         metadata_reports.append(metadata_report)
 
@@ -533,7 +613,9 @@ def build_profiles_from_folder(
             {"item": "profile_backbone_table", "value": str(backbone_path)},
             {"item": "n_object_tables_aggregated", "value": int(len(aggregation_reports))},
             {"item": "object_aggregation_statistic", "value": aggregate_statistic},
-            {"item": "external_metadata_tables", "value": ",".join(str(path) for path in metadata_paths)},
+            {"item": "duplicate_image_policy", "value": duplicate_image_policy},
+            {"item": "metadata_duplicate_policy", "value": metadata_duplicate_policy},
+            {"item": "external_metadata_tables", "value": ";".join(str(path) for path in metadata_paths)},
             {"item": "n_profiles", "value": int(profiles.shape[0])},
             {"item": "n_columns", "value": int(profiles.shape[1])},
             {"item": "n_inferred_feature_columns", "value": int(len(feature_columns))},

@@ -44,12 +44,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recursive", action="store_true", help="When --input_dir is used, search recursively for input tables.")
     parser.add_argument("--aggregate_statistic", default="median", choices=["median", "mean"])
     parser.add_argument(
+        "--duplicate_image_policy",
+        default="error",
+        choices=["error", "identical", "first"],
+        help="When --input_dir is used, policy for duplicate ImageNumber rows. Default: error.",
+    )
+    parser.add_argument(
+        "--metadata_duplicate_policy",
+        default="error",
+        choices=["error", "identical", "first"],
+        help="When --input_dir is used, policy for duplicate metadata keys. Default: error.",
+    )
+    parser.add_argument(
         "--imputation_method",
         default="median",
         choices=["median", "mean", "zero", "knn", "group_median", "group_mean"],
     )
     parser.add_argument("--imputation_group_columns", default=None)
     parser.add_argument("--add_missing_indicators", action="store_true")
+    parser.add_argument(
+        "--include_missing_indicators_in_correlation_filter",
+        action="store_true",
+        help="Include missingness indicators in correlation filtering. Default: retain indicators separately.",
+    )
     parser.add_argument("--minimum_missing_indicator_fraction", type=float, default=0.0)
     parser.add_argument("--include_qc_numeric_features", action="store_true")
     parser.add_argument("--winsorise_lower_quantile", type=float, default=None)
@@ -65,6 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_feature_missing_fraction", type=float, default=0.2)
     parser.add_argument("--max_sample_missing_fraction", type=float, default=0.5)
     parser.add_argument("--max_absolute_correlation", type=float, default=0.95)
+    parser.add_argument(
+        "--max_features_for_correlation",
+        type=int,
+        default=5000,
+        help="Maximum feature count for full pairwise correlation filtering. Larger matrices skip this step with an audit row.",
+    )
     parser.add_argument("--max_zero_fraction", type=float, default=1.0, help="Maximum allowed fraction of exact zero values per feature; 1.0 disables this filter.")
     parser.add_argument("--disable_all_zero_row_filter", action="store_true", help="Disable removal of rows whose observed retained feature values are all zero. By default this filter runs after all input files have been merged and before imputation.")
     parser.add_argument("--all_zero_row_tolerance", type=float, default=0.0, help="Absolute tolerance for treating a feature value as zero in the all-zero row filter.")
@@ -200,6 +223,8 @@ def _write_html_report(
         summary_tables={
             "Preprocessing summary": result["preprocessing_summary"],
             "Feature QC": result["feature_qc"],
+            "Sample QC before feature QC": result.get("sample_qc_before_feature_qc", pd.DataFrame()),
+            "Sample QC after feature QC": result.get("sample_qc_after_feature_qc", result["sample_qc"]),
             "Sample QC": result["sample_qc"],
             "All-zero row report": result.get("all_zero_row_report", pd.DataFrame()),
             "Imputation report": result["imputation_report"],
@@ -208,6 +233,7 @@ def _write_html_report(
             "Dropped index column report": result["dropped_index_column_report"],
             "Retained feature families": result["feature_family_summary"],
             "Column role report": result["column_role_report"],
+            "Final matrix validation": result.get("final_matrix_validation", pd.DataFrame()),
             "Preprocessing decisions": result["preprocessing_decision_log"],
             "Preprocessing config": result["preprocessing_config"],
             "Reference normalisation report": result["reference_normalisation_report"].head(2000),
@@ -246,6 +272,8 @@ def main() -> None:
             metadata_table=args.metadata_table,
             aggregate_statistic=args.aggregate_statistic,
             include_qc_numeric_features=args.include_qc_numeric_features,
+            duplicate_image_policy=args.duplicate_image_policy,
+            metadata_duplicate_policy=args.metadata_duplicate_policy,
             logger=logger,
         )
         data_frame = profile_build.profiles
@@ -284,12 +312,14 @@ def main() -> None:
         max_sample_missing_fraction=args.max_sample_missing_fraction,
         remove_correlated=not args.disable_correlation_filter,
         max_absolute_correlation=args.max_absolute_correlation,
+        max_features_for_correlation=args.max_features_for_correlation,
         max_zero_fraction=args.max_zero_fraction,
         remove_all_zero_rows=not args.disable_all_zero_row_filter,
         all_zero_row_tolerance=args.all_zero_row_tolerance,
         imputation_method=args.imputation_method,
         imputation_group_columns=imputation_group_columns,
         add_missing_indicators=args.add_missing_indicators,
+        include_missing_indicators_in_correlation_filter=args.include_missing_indicators_in_correlation_filter,
         max_missing_indicators=args.max_missing_indicators,
         minimum_missing_indicator_fraction=args.minimum_missing_indicator_fraction,
         include_qc_numeric_features=args.include_qc_numeric_features,

@@ -32,28 +32,42 @@ def _make_table_block(*, name: str, table: pd.DataFrame, max_rows: int = 50) -> 
     )
 
 
-def _copy_asset_if_requested(path: Path, assets_dir: Optional[Path]) -> Path:
-    """Copy an asset into an assets directory if requested."""
+def _copy_asset_if_requested(path: Path, assets_dir: Optional[Path]) -> tuple[Path, str]:
+    """Copy an asset and return both copied path and report-relative link.
+
+    Parameters
+    ----------
+    path:
+        Source asset path.
+    assets_dir:
+        Optional report-assets directory.
+
+    Returns
+    -------
+    tuple[pathlib.Path, str]
+        The path to display/read and the href relative to the report file.
+    """
     if assets_dir is None or not path.exists():
-        return path
+        return path, path.name
     assets_dir.mkdir(parents=True, exist_ok=True)
     target = assets_dir / path.name
     if path.resolve() != target.resolve():
         shutil.copy2(src=path, dst=target)
-    return target
+    return target, f"{assets_dir.name}/{target.name}"
 
 
 def _make_plot_block(*, path: Path, assets_dir: Optional[Path] = None) -> str:
     """Render an HTML section for a plot path."""
     path = Path(path)
-    display_path = _copy_asset_if_requested(path=path, assets_dir=assets_dir)
+    display_path, href = _copy_asset_if_requested(path=path, assets_dir=assets_dir)
     title = html.escape(path.stem.replace("_", " "))
+    href_escaped = html.escape(href)
     if path.suffix.lower() == ".svg" and path.exists():
         svg_text = path.read_text(encoding="utf-8", errors="replace")
         return f"<section class='plot'><h3>{title}</h3><div class='svg-plot'>{svg_text}</div></section>"
     if path.suffix.lower() in {".html", ".htm"}:
-        return f"<section class='plot'><h3>{title}</h3><p><a href='{html.escape(display_path.name)}'>Open interactive HTML output</a></p></section>"
-    return f"<section class='plot'><h3>{title}</h3><p><a href='{html.escape(display_path.name)}'>{html.escape(display_path.name)}</a></p></section>"
+        return f"<section class='plot'><h3>{title}</h3><p><a href='{href_escaped}'>Open interactive HTML output</a></p></section>"
+    return f"<section class='plot'><h3>{title}</h3><p><a href='{href_escaped}'>{html.escape(display_path.name)}</a></p></section>"
 
 
 def _summary_cards(summary_tables: Mapping[str, pd.DataFrame]) -> str:

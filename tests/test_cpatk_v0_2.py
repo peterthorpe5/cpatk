@@ -306,7 +306,10 @@ class CpatkV02Tests(unittest.TestCase):
             backend_module="definitely_missing_clipn_backend",
             feature_columns=self.features.columns.tolist(),
         )
-        result = run_clipn_adapter(datasets={"dataset1": self.table}, config=config)
+        result = run_clipn_adapter(
+            datasets={"dataset1": self.table, "dataset2": self.table.copy()},
+            config=config,
+        )
         self.assertIn("clipn_status", result)
         self.assertIn("clipn_feature_summary", result)
 

@@ -19,6 +19,41 @@ from sklearn.metrics import adjusted_rand_score, silhouette_score
 from sklearn.neighbors import NearestNeighbors
 
 
+
+
+def _kmeans_fit_predict(
+    *,
+    features: pd.DataFrame,
+    n_clusters: int,
+    random_state: int,
+    n_init: int = 1,
+) -> np.ndarray:
+    """Run K-means with a one-thread native-library guard when available.
+
+    Repeated small K-means calls in test and CI environments can interact badly
+    with optional BLAS/OpenMP thread pools. Limiting native threads keeps the
+    workflow deterministic and prevents full unittest discovery from hanging in
+    constrained environments.
+    """
+    try:
+        from threadpoolctl import threadpool_limits  # type: ignore
+
+        with threadpool_limits(limits=1):
+            return KMeans(
+                n_clusters=n_clusters,
+                random_state=random_state,
+                n_init=n_init,
+                algorithm="lloyd",
+            ).fit_predict(X=features)
+    except Exception:
+        return KMeans(
+            n_clusters=n_clusters,
+            random_state=random_state,
+            n_init=n_init,
+            algorithm="lloyd",
+        ).fit_predict(X=features)
+
+
 def _validate_non_empty_numeric_features(*, features: pd.DataFrame) -> pd.DataFrame:
     """Return a finite numeric feature matrix or raise an informative error."""
     if features.empty:
@@ -203,7 +238,12 @@ def consensus_clustering(
     for iteration in range(n_bootstraps):
         sampled = np.sort(rng.choice(n_profiles, size=sample_size, replace=False))
         subset = numeric.iloc[sampled, :]
-        labels = KMeans(n_clusters=n_clusters, random_state=random_state + iteration, n_init=n_init).fit_predict(X=subset)
+        labels = _kmeans_fit_predict(
+            features=subset,
+            n_clusters=n_clusters,
+            random_state=random_state + iteration,
+            n_init=n_init,
+        )
         same_cluster = labels[:, None] == labels[None, :]
         co_observed[np.ix_(sampled, sampled)] += 1.0
         co_cluster[np.ix_(sampled, sampled)] += same_cluster.astype(float)
@@ -251,7 +291,12 @@ def permutation_test_cluster_structure_detailed(
     _validate_cluster_parameters(features=numeric, n_clusters=n_clusters)
     _validate_iterations(value=n_permutations, name="n_permutations")
     rng = np.random.default_rng(seed=random_state)
-    labels = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=n_init).fit_predict(X=numeric)
+    labels = _kmeans_fit_predict(
+        features=numeric,
+        n_clusters=n_clusters,
+        random_state=random_state,
+        n_init=n_init,
+    )
     observed = float(silhouette_score(X=numeric, labels=labels, metric=metric))
     null_records = []
     values = numeric.to_numpy(copy=True)
@@ -260,11 +305,12 @@ def permutation_test_cluster_structure_detailed(
         for column_index in range(permuted.shape[1]):
             rng.shuffle(permuted[:, column_index])
         permuted_frame = pd.DataFrame(data=permuted, columns=numeric.columns)
-        permuted_labels = KMeans(
+        permuted_labels = _kmeans_fit_predict(
+            features=permuted_frame,
             n_clusters=n_clusters,
             random_state=random_state + iteration + 1,
             n_init=n_init,
-        ).fit_predict(X=permuted_frame)
+        )
         null_score = float(silhouette_score(X=permuted_frame, labels=permuted_labels, metric=metric))
         null_records.append(
             {
@@ -340,13 +386,23 @@ def bootstrap_cluster_stability(
         raise ValueError("sample_fraction must be in the interval (0, 1].")
     rng = np.random.default_rng(seed=random_state)
     n_profiles = numeric.shape[0]
-    full_labels = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=n_init).fit_predict(X=numeric)
+    full_labels = _kmeans_fit_predict(
+        features=numeric,
+        n_clusters=n_clusters,
+        random_state=random_state,
+        n_init=n_init,
+    )
     sample_size = max(n_clusters + 1, int(round(n_profiles * sample_fraction)))
     sample_size = min(sample_size, n_profiles)
     records = []
     for iteration in range(n_bootstraps):
         sampled = np.sort(rng.choice(n_profiles, size=sample_size, replace=False))
-        labels = KMeans(n_clusters=n_clusters, random_state=random_state + iteration + 1, n_init=n_init).fit_predict(X=numeric.iloc[sampled, :])
+        labels = _kmeans_fit_predict(
+            features=numeric.iloc[sampled, :],
+            n_clusters=n_clusters,
+            random_state=random_state + iteration + 1,
+            n_init=n_init,
+        )
         records.append(
             {
                 "bootstrap_index": int(iteration),
@@ -394,7 +450,12 @@ def evaluate_kmeans_k_range(
         if k < 2 or k >= numeric.shape[0]:
             records.append({"n_clusters": k, "status": "skipped_invalid_k"})
             continue
-        labels = KMeans(n_clusters=k, random_state=random_state, n_init=1).fit_predict(X=numeric)
+        labels = _kmeans_fit_predict(
+            features=numeric,
+            n_clusters=k,
+            random_state=random_state,
+            n_init=1,
+        )
         silhouette = float(silhouette_score(X=numeric, labels=labels, metric=metric))
         stability = bootstrap_cluster_stability(
             features=numeric,

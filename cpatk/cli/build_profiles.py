@@ -30,6 +30,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recursive", action="store_true", help="Search input_dir recursively.")
     parser.add_argument("--aggregate_statistic", default="median", choices=["median", "mean"])
     parser.add_argument("--include_qc_numeric_features", action="store_true")
+    parser.add_argument(
+        "--duplicate_image_policy",
+        default="error",
+        choices=["error", "identical", "first"],
+        help="Policy for duplicate ImageNumber rows in the backbone table. Default: error.",
+    )
+    parser.add_argument(
+        "--metadata_duplicate_policy",
+        default="error",
+        choices=["error", "identical", "first"],
+        help="Policy for duplicate plate/well rows in external metadata. Default: error.",
+    )
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser
 
@@ -50,6 +62,8 @@ def main() -> None:
         metadata_table=args.metadata_table,
         aggregate_statistic=args.aggregate_statistic,
         include_qc_numeric_features=args.include_qc_numeric_features,
+        duplicate_image_policy=args.duplicate_image_policy,
+        metadata_duplicate_policy=args.metadata_duplicate_policy,
         logger=logger,
     )
     logger.info("CPATK profile building complete")

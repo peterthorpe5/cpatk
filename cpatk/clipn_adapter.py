@@ -89,8 +89,10 @@ METADATA_ALIASES = {
         "Plate",
         "plate",
         "Image_Metadata_Plate",
-        "Source_Plate_Barcode",
         "Assay_Plate_Barcode",
+        "AssayPlateBarcode",
+        "Destination_Plate_Barcode",
+        "DestinationPlateBarcode",
     ),
     "Well_Metadata": (
         "Well_Metadata",
@@ -98,8 +100,10 @@ METADATA_ALIASES = {
         "Well",
         "well",
         "Image_Metadata_Well",
-        "Source_Well",
+        "Assay_Well",
+        "AssayWell",
         "Destination_Well",
+        "DestinationWell",
     ),
 }
 
@@ -152,6 +156,9 @@ class ClipnAdapterConfig:
     random_state: int = 42
     n_neighbours: int = 15
     distance_metric: str = "cosine"
+    remove_all_zero_rows: bool = True
+    remove_all_zero_features: bool = True
+    drop_rows_with_any_zero: bool = False
     allow_pca_fallback: bool = False
 
 
@@ -304,6 +311,119 @@ def standardise_clipn_metadata(
     return output, alias_report
 
 
+def split_single_dataset_by_group(
+    *,
+    data_frame: pd.DataFrame,
+    group_column: str,
+    random_state: int = 42,
+    split_names: tuple[str, str] = ("split_a", "split_b"),
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """Split one table into two CLIPn datasets without splitting compounds.
+
+    Parameters
+    ----------
+    data_frame:
+        Input table to split.
+    group_column:
+        Column used to keep related rows together, usually ``cpd_id`` or
+        ``Metadata_Compound``.
+    random_state:
+        Random seed for reproducible group assignment.
+    split_names:
+        Names to use for the two output datasets.
+
+    Returns
+    -------
+    tuple[dict[str, pandas.DataFrame], pandas.DataFrame]
+        Two datasets and a group-to-split report.
+
+    Raises
+    ------
+    ValueError
+        If the grouping column is missing or has fewer than two groups.
+    """
+    if group_column not in data_frame.columns:
+        raise ValueError(f"Cannot split single CLIPn dataset; missing group column: {group_column}")
+    groups = sorted(data_frame[group_column].dropna().astype(str).unique().tolist())
+    if len(groups) < 2:
+        raise ValueError("Cannot split single CLIPn dataset; at least two non-missing groups are required.")
+    rng = np.random.default_rng(seed=int(random_state))
+    shuffled = np.asarray(groups, dtype=object)
+    rng.shuffle(shuffled)
+    midpoint = max(1, int(math.ceil(len(shuffled) / 2)))
+    split_a_groups = set(map(str, shuffled[:midpoint]))
+    assignments = {
+        str(group): split_names[0] if str(group) in split_a_groups else split_names[1]
+        for group in groups
+    }
+    report = pd.DataFrame(
+        {
+            group_column: list(assignments.keys()),
+            "assigned_dataset": list(assignments.values()),
+        }
+    )
+    split_series = data_frame[group_column].astype(str).map(assignments)
+    datasets = {
+        name: data_frame.loc[split_series == name].reset_index(drop=True).copy()
+        for name in split_names
+    }
+    empty = [name for name, table in datasets.items() if table.empty]
+    if empty:
+        raise ValueError(f"Single-dataset split created empty datasets: {empty}")
+    return datasets, report
+
+
+def validate_clipn_dataset_count(*, datasets: Mapping[str, pd.DataFrame]) -> None:
+    """Require at least two non-empty datasets for CLIPn integration."""
+    non_empty = [name for name, table in datasets.items() if not table.empty]
+    if len(non_empty) < 2:
+        raise ValueError(
+            "CLIPn integration requires at least two non-empty datasets. "
+            "Provide a manifest/repeated --dataset entries, or split one table by compound using "
+            "--split_single_dataset_by_column."
+        )
+
+
+def remove_zero_only_clipn_profiles(
+    *,
+    table: pd.DataFrame,
+    feature_cols: Sequence[str],
+    config: ClipnAdapterConfig,
+) -> tuple[pd.DataFrame, list[str], int, int]:
+    """Remove zero-only rows/features before CLIPn modelling.
+
+    Literal zero values can be introduced by valid preprocessing and scaling, so
+    the default policy removes only all-zero feature columns and all-zero rows.
+    The optional ``drop_rows_with_any_zero`` mode is deliberately off by default
+    because it can be very destructive for scaled Cell Painting profiles.
+    """
+    output = table.copy()
+    features = list(feature_cols)
+    dropped_features: list[str] = []
+    rows_dropped_all_zero = 0
+    rows_dropped_any_zero = 0
+    if features and config.remove_all_zero_features:
+        zero_feature_mask = output[features].fillna(0.0).eq(0.0).all(axis=0)
+        dropped_features = zero_feature_mask[zero_feature_mask].index.astype(str).tolist()
+        features = [feature for feature in features if feature not in dropped_features]
+        output = output.drop(columns=dropped_features, errors="ignore")
+    if features and config.remove_all_zero_rows:
+        zero_row_mask = output[features].fillna(0.0).eq(0.0).all(axis=1)
+        rows_dropped_all_zero = int(zero_row_mask.sum())
+        output = output.loc[~zero_row_mask].copy()
+    if features and config.drop_rows_with_any_zero:
+        any_zero_mask = output[features].eq(0.0).any(axis=1)
+        rows_dropped_any_zero = int(any_zero_mask.sum())
+        output = output.loc[~any_zero_mask].copy()
+    return (
+        output,
+        [feature for feature in features if feature in output.columns],
+        dropped_features,
+        rows_dropped_all_zero,
+        rows_dropped_any_zero,
+    )
+
+
 def read_datasets_manifest(*, path: Path | str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     """Read a dataset manifest with columns ``dataset`` and ``path``."""
     manifest = read_table(path=path, logger=logger)
@@ -377,6 +497,7 @@ def align_dataset_features(
     """Align multiple datasets to a shared numeric feature set."""
     if not datasets:
         raise ValueError("At least one dataset is required.")
+    validate_clipn_dataset_count(datasets=datasets)
     feature_sets = {}
     for name, table in datasets.items():
         if feature_columns is None:
@@ -449,20 +570,34 @@ def clean_impute_and_scale_aligned(
     if n_extreme:
         table.loc[:, feature_cols] = table[feature_cols].where(~extreme_mask, np.nan)
     missing_fraction = table[feature_cols].isna().mean(axis=0)
-    dropped_features = missing_fraction[
+    missingness_dropped_features = missing_fraction[
         missing_fraction > config.max_feature_missing_fraction
     ].index.tolist()
-    feature_cols = [c for c in feature_cols if c not in dropped_features]
+    feature_cols = [c for c in feature_cols if c not in missingness_dropped_features]
     row_missing_fraction = table[feature_cols].isna().mean(axis=1) if feature_cols else pd.Series(1.0, index=table.index)
     row_keep = row_missing_fraction <= config.max_sample_missing_fraction
     dropped_rows = int((~row_keep).sum())
     table = table.loc[row_keep, ["Dataset", "Sample", *feature_cols]].copy()
+    (
+        table,
+        feature_cols,
+        zero_only_dropped_features,
+        rows_dropped_all_zero,
+        rows_dropped_any_zero,
+    ) = remove_zero_only_clipn_profiles(
+        table=table,
+        feature_cols=feature_cols,
+        config=config,
+    )
 
+    if not feature_cols:
+        raise ValueError("No CLIPn features remained after missingness/zero filtering.")
     n_missing_before = int(table[feature_cols].isna().sum().sum()) if feature_cols else 0
     if config.imputation_method == "none":
         pass
     elif config.imputation_method == "knn":
-        imputer = KNNImputer(n_neighbors=5)
+        n_neighbours = min(5, max(1, int(table.shape[0]) - 1))
+        imputer = KNNImputer(n_neighbors=n_neighbours)
         table.loc[:, feature_cols] = imputer.fit_transform(table[feature_cols])
     elif config.imputation_method in {"median", "mean"}:
         strategy = config.imputation_method
@@ -493,9 +628,12 @@ def clean_impute_and_scale_aligned(
                 "item": "shared_features_before_missingness_filter",
                 "value": int(len(aligned[next(iter(aligned))].columns)) if aligned else 0,
             },
-            {"item": "features_dropped_for_missingness", "value": int(len(dropped_features))},
+            {"item": "features_dropped_for_missingness", "value": int(len(missingness_dropped_features))},
             {"item": "features_after_missingness_filter", "value": int(len(feature_cols))},
+            {"item": "zero_only_features_dropped", "value": int(len(zero_only_dropped_features))},
             {"item": "rows_dropped_for_missingness", "value": dropped_rows},
+            {"item": "all_zero_rows_dropped", "value": rows_dropped_all_zero},
+            {"item": "rows_with_any_zero_dropped", "value": rows_dropped_any_zero},
             {"item": "extreme_values_converted_to_missing", "value": n_extreme},
             {"item": "missing_values_before_imputation", "value": n_missing_before},
             {"item": "missing_values_after_imputation", "value": n_missing_after},
@@ -1014,14 +1152,14 @@ def run_clipn_workflow(
         narrative=(
             "This report summarises the optional CLIPn workflow. The adapter first harmonises "
             "features across datasets, cleans non-finite values, handles missing data, scales "
-            "features, and then runs a compatible CLIPn backend when available. If the backend "
+            "features, removes zero-only rows/features for CLIPn compatibility, and then runs a compatible CLIPn backend when available. If the backend "
             "is unavailable, the report records the reason and preserves all preprocessing audits."
         ),
         warnings=warnings,
         methods_text=(
             "CLIPn is treated as an optional integration layer. CPATK freezes the shared feature "
             "intersection before model fitting to prevent accidental feature-order drift between "
-            "datasets. Metadata and encoded labels are excluded from the input feature matrix. "
+            "datasets and requires at least two non-empty datasets. Metadata and encoded labels are excluded from the input feature matrix. "
             "Latent-space diagnostics are descriptive checks of replicate, class and dataset "
             "structure; they should be interpreted alongside the non-AI CPATK workflow."
         ),

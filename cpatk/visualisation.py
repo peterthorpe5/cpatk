@@ -818,25 +818,43 @@ def run_visualisation_workflow(
         features.index = work.index.astype(str)
 
     outputs: dict[str, Path] = {}
-    write_table(
+    outputs["visualisation_feature_columns"] = write_table(
         data_frame=pd.DataFrame({"feature": feature_cols}),
         path=output_dir / "visualisation_feature_columns.tsv",
         logger=logger,
     )
     norm_summary = l2_norm_summary(features=features)
-    write_table(data_frame=norm_summary, path=output_dir / "latent_norm_summary.tsv", logger=logger)
-    plot_l2_norm_histogram(features=features, output_path_base=plots_dir / "latent_norm_histogram", logger=logger)
+    outputs["latent_norm_summary"] = write_table(
+        data_frame=norm_summary,
+        path=output_dir / "latent_norm_summary.tsv",
+        logger=logger,
+    )
+    norm_plots = plot_l2_norm_histogram(
+        features=features,
+        output_path_base=plots_dir / "latent_norm_histogram",
+        logger=logger,
+    )
+    for index, path in enumerate(norm_plots, start=1):
+        outputs[f"latent_norm_histogram_{index}"] = path
 
     colour_columns = list(colour_columns or [])
     colour_for_default = colour_columns[0] if colour_columns else None
 
     if make_pca:
         pca_coords, pca_var = calculate_pca(features=features, n_components=2)
-        write_table(data_frame=pca_coords.reset_index(names="profile_id"), path=output_dir / "pca_coordinates.tsv", logger=logger)
-        write_table(data_frame=pca_var, path=output_dir / "pca_variance.tsv", logger=logger)
+        outputs["pca_coordinates"] = write_table(
+            data_frame=pca_coords.reset_index(names="profile_id"),
+            path=output_dir / "pca_coordinates.tsv",
+            logger=logger,
+        )
+        outputs["pca_variance"] = write_table(
+            data_frame=pca_var,
+            path=output_dir / "pca_variance.tsv",
+            logger=logger,
+        )
         for colour in colour_columns or [None]:
             suffix = str(colour or "uncoloured")
-            plot_coordinates(
+            pca_plot_paths = plot_coordinates(
                 coordinates=pca_coords,
                 metadata=metadata,
                 x_column="PC1",
@@ -847,8 +865,10 @@ def run_visualisation_workflow(
                 title=f"PCA coloured by {suffix}",
                 logger=logger,
             )
+            for index, path in enumerate(pca_plot_paths, start=1):
+                outputs[f"pca_{suffix}_plot_{index}"] = path
             if interactive:
-                write_interactive_coordinates(
+                interactive_path = write_interactive_coordinates(
                     coordinates=pca_coords,
                     metadata=metadata,
                     x_column="PC1",
@@ -858,14 +878,20 @@ def run_visualisation_workflow(
                     title=f"Interactive PCA coloured by {suffix}",
                     logger=logger,
                 )
+                if interactive_path is not None:
+                    outputs[f"pca_{suffix}_interactive"] = interactive_path
 
     if make_umap:
         try:
             umap_coords = calculate_umap(features=features)
-            write_table(data_frame=umap_coords.reset_index(names="profile_id"), path=output_dir / "umap_coordinates.tsv", logger=logger)
+            outputs["umap_coordinates"] = write_table(
+                data_frame=umap_coords.reset_index(names="profile_id"),
+                path=output_dir / "umap_coordinates.tsv",
+                logger=logger,
+            )
             for colour in colour_columns or [None]:
                 suffix = str(colour or "uncoloured")
-                plot_coordinates(
+                umap_plot_paths = plot_coordinates(
                     coordinates=umap_coords,
                     metadata=metadata,
                     x_column="UMAP1",
@@ -876,8 +902,10 @@ def run_visualisation_workflow(
                     title=f"UMAP coloured by {suffix}",
                     logger=logger,
                 )
+                for index, path in enumerate(umap_plot_paths, start=1):
+                    outputs[f"umap_{suffix}_plot_{index}"] = path
                 if interactive:
-                    write_interactive_coordinates(
+                    interactive_path = write_interactive_coordinates(
                         coordinates=umap_coords,
                         metadata=metadata,
                         x_column="UMAP1",
@@ -887,6 +915,8 @@ def run_visualisation_workflow(
                         title=f"Interactive UMAP coloured by {suffix}",
                         logger=logger,
                     )
+                    if interactive_path is not None:
+                        outputs[f"umap_{suffix}_interactive"] = interactive_path
         except Exception as exc:
             if logger is not None:
                 logger.warning("UMAP output skipped: %s", exc)
@@ -894,8 +924,12 @@ def run_visualisation_workflow(
     if make_phate:
         try:
             phate_coords = calculate_phate(features=features)
-            write_table(data_frame=phate_coords.reset_index(names="profile_id"), path=output_dir / "phate_coordinates.tsv", logger=logger)
-            plot_coordinates(
+            outputs["phate_coordinates"] = write_table(
+                data_frame=phate_coords.reset_index(names="profile_id"),
+                path=output_dir / "phate_coordinates.tsv",
+                logger=logger,
+            )
+            phate_plot_paths = plot_coordinates(
                 coordinates=phate_coords,
                 metadata=metadata,
                 x_column="PHATE1",
@@ -906,6 +940,8 @@ def run_visualisation_workflow(
                 title="PHATE projection",
                 logger=logger,
             )
+            for index, path in enumerate(phate_plot_paths, start=1):
+                outputs[f"phate_plot_{index}"] = path
         except Exception as exc:
             if logger is not None:
                 logger.warning("PHATE output skipped: %s", exc)
@@ -918,9 +954,24 @@ def run_visualisation_workflow(
             max_rows=120,
             logger=logger,
         )
-        write_table(data_frame=ordered.reset_index(names="profile_id"), path=output_dir / "heatmap_matrix.tsv", logger=logger)
-        write_table(data_frame=row_order, path=output_dir / "heatmap_row_order.tsv", logger=logger)
-        write_table(data_frame=col_order, path=output_dir / "heatmap_column_order.tsv", logger=logger)
+        outputs["heatmap_matrix"] = write_table(
+            data_frame=ordered.reset_index(names="profile_id"),
+            path=output_dir / "heatmap_matrix.tsv",
+            logger=logger,
+        )
+        outputs["heatmap_row_order"] = write_table(
+            data_frame=row_order,
+            path=output_dir / "heatmap_row_order.tsv",
+            logger=logger,
+        )
+        outputs["heatmap_column_order"] = write_table(
+            data_frame=col_order,
+            path=output_dir / "heatmap_column_order.tsv",
+            logger=logger,
+        )
+        heatmap_plots = sorted(plots_dir.glob("profile_feature_heatmap.*"))
+        for index, path in enumerate(heatmap_plots, start=1):
+            outputs[f"profile_feature_heatmap_{index}"] = path
 
     if make_topology:
         nodes, edges, coords = build_knn_topology(
@@ -929,10 +980,26 @@ def run_visualisation_workflow(
             id_column=id_column,
             colour_column=colour_for_default,
         )
-        write_table(data_frame=nodes, path=output_dir / "topology_nodes.tsv", logger=logger)
-        write_table(data_frame=edges, path=output_dir / "topology_edges.tsv", logger=logger)
-        write_table(data_frame=coords, path=output_dir / "topology_coordinates.tsv", logger=logger)
-        plot_knn_topology(nodes=nodes, edges=edges, coordinates=coords, output_path_base=plots_dir / "topology_graph", logger=logger)
+        outputs["topology_nodes"] = write_table(data_frame=nodes, path=output_dir / "topology_nodes.tsv", logger=logger)
+        outputs["topology_edges"] = write_table(data_frame=edges, path=output_dir / "topology_edges.tsv", logger=logger)
+        outputs["topology_coordinates"] = write_table(data_frame=coords, path=output_dir / "topology_coordinates.tsv", logger=logger)
+        topology_plots = plot_knn_topology(
+            nodes=nodes,
+            edges=edges,
+            coordinates=coords,
+            output_path_base=plots_dir / "topology_graph",
+            logger=logger,
+        )
+        for index, path in enumerate(topology_plots, start=1):
+            outputs[f"topology_graph_{index}"] = path
         if interactive:
-            write_interactive_topology(nodes=nodes, edges=edges, coordinates=coords, output_path=plots_dir / "topology_graph.html", logger=logger)
+            interactive_path = write_interactive_topology(
+                nodes=nodes,
+                edges=edges,
+                coordinates=coords,
+                output_path=plots_dir / "topology_graph.html",
+                logger=logger,
+            )
+            if interactive_path is not None:
+                outputs["topology_graph_interactive"] = interactive_path
     return outputs
