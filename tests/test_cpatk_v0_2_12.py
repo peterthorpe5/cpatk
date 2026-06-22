@@ -1,4 +1,4 @@
-"""Tests for CPATK v0.2.12 multi-plate and batch hardening."""
+"""Tests for CPATK v0.2.13 multi-plate and batch hardening."""
 
 from __future__ import annotations
 

@@ -28,11 +28,35 @@ from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.decomposition import PCA
-from sklearn.impute import KNNImputer, SimpleImputer
-from sklearn.metrics import pairwise_distances, silhouette_score
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import LabelEncoder, RobustScaler, StandardScaler
+try:
+    from sklearn.decomposition import PCA
+    from sklearn.impute import KNNImputer, SimpleImputer
+    from sklearn.metrics import pairwise_distances, silhouette_score
+    from sklearn.neighbors import NearestNeighbors
+    from sklearn.preprocessing import LabelEncoder, RobustScaler, StandardScaler
+    SKLEARN_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - exercised in broken HPC environments
+    PCA = None
+    KNNImputer = None
+    SimpleImputer = None
+    pairwise_distances = None
+    silhouette_score = None
+    NearestNeighbors = None
+    LabelEncoder = None
+    RobustScaler = None
+    StandardScaler = None
+    SKLEARN_IMPORT_ERROR = exc
+
+
+def require_sklearn_stack(*, purpose: str) -> None:
+    """Raise a clear error when the SciPy/scikit-learn stack cannot import."""
+    if SKLEARN_IMPORT_ERROR is not None:
+        raise ImportError(
+            "The SciPy/scikit-learn stack could not be imported for "
+            f"{purpose}. This often means the conda environment is using an "
+            "older system libstdc++. Put ${CONDA_PREFIX}/lib first in "
+            "LD_LIBRARY_PATH or reinstall scipy/scikit-learn from conda-forge."
+        ) from SKLEARN_IMPORT_ERROR
 
 from cpatk.embedding import run_pca, run_umap_or_pca
 from cpatk.io import read_table, write_excel_workbook, write_table
@@ -652,6 +676,7 @@ def encode_labels_for_clipn(
     config: ClipnAdapterConfig,
 ) -> tuple[dict[str, np.ndarray], LabelEncoder, pd.DataFrame]:
     """Encode the configured label column globally across datasets."""
+    require_sklearn_stack(purpose="CLIPn label encoding")
     labels = []
     for name, table in datasets.items():
         if config.label_column in table.columns:
@@ -878,6 +903,7 @@ def fit_pca_fallback(
     names = list(cleaned.keys())
     matrix = pd.concat([cleaned[name] for name in names], ignore_index=True, sort=False)
     n_components = min(config.latent_dim, matrix.shape[0], matrix.shape[1])
+    require_sklearn_stack(purpose="PCA fallback")
     model = PCA(n_components=max(1, n_components), random_state=config.random_state)
     values = model.fit_transform(matrix)
     frames = []
@@ -916,6 +942,7 @@ def calculate_latent_diagnostics(
     variance["is_low_variance"] = variance["variance"] < 1e-8
 
     k = min(max(1, config.n_neighbours), X.shape[0] - 1)
+    require_sklearn_stack(purpose="latent nearest-neighbour analysis")
     nn = NearestNeighbors(n_neighbors=k + 1, metric=config.distance_metric)
     nn.fit(X)
     distances, indices = nn.kneighbors(X, return_distance=True)
@@ -961,6 +988,7 @@ def calculate_latent_diagnostics(
             labels = latent_table[col].fillna("NA").astype(str)
             if labels.value_counts().min() >= 2:
                 try:
+                    require_sklearn_stack(purpose="latent diagnostics")
                     score = silhouette_score(X, labels, metric=config.distance_metric)
                     metrics.append({"metric": f"silhouette_{col}", "value": float(score)})
                 except Exception:

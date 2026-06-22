@@ -15,10 +15,49 @@ from typing import Iterable, Optional, Sequence
 
 import numpy as np
 import pandas as pd
-from scipy.spatial.distance import pdist, squareform
-from scipy.cluster.hierarchy import dendrogram, fcluster, leaves_list, linkage
-from sklearn.decomposition import PCA
-from sklearn.metrics import adjusted_rand_score, pairwise_distances, silhouette_score
+try:
+    from scipy.spatial.distance import pdist, squareform
+    from scipy.cluster.hierarchy import dendrogram, fcluster, leaves_list, linkage
+    SCIPY_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - exercised in broken HPC environments
+    pdist = None
+    squareform = None
+    dendrogram = None
+    fcluster = None
+    leaves_list = None
+    linkage = None
+    SCIPY_IMPORT_ERROR = exc
+
+try:
+    from sklearn.decomposition import PCA
+    from sklearn.metrics import adjusted_rand_score, pairwise_distances, silhouette_score
+    SKLEARN_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - exercised in broken HPC environments
+    PCA = None
+    adjusted_rand_score = None
+    pairwise_distances = None
+    silhouette_score = None
+    SKLEARN_IMPORT_ERROR = exc
+
+
+def require_scipy_stack(*, purpose: str) -> None:
+    """Raise a clear error when SciPy clustering/distance helpers are unavailable."""
+    if SCIPY_IMPORT_ERROR is not None:
+        raise ImportError(
+            "SciPy could not be imported for "
+            f"{purpose}. This often means the environment is loading an older "
+            "system libstdc++ before the conda environment library path."
+        ) from SCIPY_IMPORT_ERROR
+
+
+def require_sklearn_stack(*, purpose: str) -> None:
+    """Raise a clear error when scikit-learn helpers are unavailable."""
+    if SKLEARN_IMPORT_ERROR is not None:
+        raise ImportError(
+            "scikit-learn could not be imported for "
+            f"{purpose}. Put ${CONDA_PREFIX}/lib first in LD_LIBRARY_PATH or "
+            "reinstall scipy/scikit-learn from conda-forge."
+        ) from SKLEARN_IMPORT_ERROR
 
 LOGGER = logging.getLogger(__name__)
 
@@ -197,6 +236,7 @@ def choose_k_by_silhouette(
             continue
         try:
             labels, _ = simple_kmeans_labels(values=x, n_clusters=k, random_state=random_state)
+            require_sklearn_stack(purpose="silhouette-based K selection")
             score = silhouette_score(x, labels, metric="cosine")
             rows.append({"k": k, "silhouette": float(score), "status": "tested"})
         except Exception as exc:  # pragma: no cover - defensive branch
@@ -254,6 +294,7 @@ def bootstrap_kmeans_stability(
             continue
         full_labels, _ = simple_kmeans_labels(values=x, n_clusters=k, random_state=random_state)
         try:
+            require_sklearn_stack(purpose="bootstrap K-means stability")
             full_silhouette = silhouette_score(x, full_labels, metric="cosine")
         except Exception:
             full_silhouette = np.nan
@@ -273,6 +314,7 @@ def bootstrap_kmeans_stability(
                 scores = x @ centres.T
                 labels_full = np.argmax(scores, axis=1)
                 labels_full[idx] = labels_sub
+                require_sklearn_stack(purpose="bootstrap ARI scoring")
                 ari_values.append(adjusted_rand_score(full_labels, labels_full))
                 sil_values.append(silhouette_score(x, labels_full, metric="cosine"))
             except Exception:
@@ -371,6 +413,216 @@ def make_pseudo_anchors(
     summary["bootstrap_used"] = bool(bootstrap)
     summary["aggregate_method"] = aggregate_method
     return anchors, summary, clusters, k_selection.merge(aggregation_summary.head(0), how="cross") if False else k_selection
+
+
+
+def normalise_phenotype_label_table(
+    *,
+    label_table: pd.DataFrame,
+    id_column: str,
+    label_column: str,
+    split_regex: Optional[str] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return a cleaned compound-to-phenotype label table and an audit table.
+
+    Parameters
+    ----------
+    label_table:
+        Input table containing compound identifiers and biological phenotype or
+        mechanism labels.
+    id_column:
+        Column containing compound identifiers. This should match the identifier
+        used in the embedding/profile table, usually ``cpd_id``.
+    label_column:
+        Column containing phenotype labels.
+    split_regex:
+        Optional regular expression used to split multi-label cells. If omitted,
+        each cell is treated as one label. This is safer when labels contain
+        punctuation that is meaningful to the curator.
+
+    Returns
+    -------
+    tuple[pandas.DataFrame, pandas.DataFrame]
+        The cleaned long-format label table and a compact audit table.
+    """
+    missing = [column for column in (id_column, label_column) if column not in label_table.columns]
+    if missing:
+        raise KeyError(f"Phenotype label table is missing required columns: {missing}")
+
+    raw = label_table[[id_column, label_column]].copy()
+    n_raw_rows = int(raw.shape[0])
+    raw[id_column] = raw[id_column].astype(str).str.strip()
+    raw[label_column] = raw[label_column].astype(str).str.strip()
+    raw = raw.loc[raw[id_column].ne("") & raw[label_column].ne(""), :]
+    raw = raw.loc[~raw[id_column].str.lower().isin({"nan", "none", "na"}), :]
+    raw = raw.loc[~raw[label_column].str.lower().isin({"nan", "none", "na"}), :]
+
+    if split_regex:
+        raw[label_column] = raw[label_column].str.split(split_regex)
+        raw = raw.explode(label_column)
+        raw[label_column] = raw[label_column].astype(str).str.strip()
+        raw = raw.loc[raw[label_column].ne(""), :]
+
+    n_after_missing = int(raw.shape[0])
+    exact_duplicates = int(raw.duplicated(subset=[id_column, label_column]).sum())
+    clean = raw.drop_duplicates(subset=[id_column, label_column]).reset_index(drop=True)
+    multi_label_counts = clean.groupby(id_column, dropna=False)[label_column].nunique(dropna=True)
+    n_multi_label_ids = int((multi_label_counts > 1).sum())
+    audit = pd.DataFrame(
+        [
+            {"metric": "raw_rows", "value": n_raw_rows},
+            {"metric": "rows_after_missing_label_filter", "value": n_after_missing},
+            {"metric": "exact_duplicate_rows_removed", "value": exact_duplicates},
+            {"metric": "clean_label_rows", "value": int(clean.shape[0])},
+            {"metric": "unique_labelled_ids", "value": int(clean[id_column].nunique(dropna=True))},
+            {"metric": "ids_with_multiple_distinct_labels", "value": n_multi_label_ids},
+        ]
+    )
+    return clean, audit
+
+
+def label_pseudo_anchor_clusters(
+    *,
+    anchors: pd.DataFrame,
+    clusters: pd.DataFrame,
+    label_table: pd.DataFrame,
+    id_column: str,
+    label_column: str,
+    pseudo_column: str = "pseudo_moa",
+    final_column: str = "moa_final",
+    min_labelled_fraction: float = 0.2,
+    min_dominant_fraction: float = 0.5,
+    top_n_labels: int = 3,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Annotate pseudo-anchor clusters using known compound phenotypes.
+
+    The function keeps pseudo-anchor identifiers intact, but adds a final
+    interpretable label column. A cluster receives the dominant phenotype label
+    only when enough of its compounds are labelled and the dominant label is
+    sufficiently consistent among labelled members. Otherwise the final label
+    remains the pseudo-anchor identifier, preventing weak annotation from being
+    over-interpreted.
+
+    Parameters
+    ----------
+    anchors:
+        Pseudo-anchor assignment table produced by :func:`make_pseudo_anchors`.
+    clusters:
+        Cluster membership table produced by :func:`make_pseudo_anchors`.
+    label_table:
+        Clean long-format table containing identifier and label columns.
+    id_column:
+        Compound identifier column.
+    label_column:
+        Phenotype label column in ``label_table``.
+    pseudo_column:
+        Pseudo-anchor column to annotate.
+    final_column:
+        Name of the final interpreted MOA/phenotype column to add.
+    min_labelled_fraction:
+        Minimum fraction of all cluster members that must have at least one
+        phenotype label before the cluster can receive a biological label.
+    min_dominant_fraction:
+        Minimum fraction of labelled members supporting the dominant phenotype.
+    top_n_labels:
+        Number of label/count pairs to include in the compact top-label summary.
+
+    Returns
+    -------
+    tuple[pandas.DataFrame, pandas.DataFrame, pandas.DataFrame]
+        Labelled anchors, labelled clusters and a cluster-level label summary.
+    """
+    for table_name, table in {"anchors": anchors, "clusters": clusters}.items():
+        missing = [column for column in (id_column, pseudo_column) if column not in table.columns]
+        if missing:
+            raise KeyError(f"{table_name} table is missing required columns: {missing}")
+    missing_label = [column for column in (id_column, label_column) if column not in label_table.columns]
+    if missing_label:
+        raise KeyError(f"Label table is missing required columns: {missing_label}")
+
+    if not (0.0 <= min_labelled_fraction <= 1.0):
+        raise ValueError("min_labelled_fraction must be between 0 and 1.")
+    if not (0.0 <= min_dominant_fraction <= 1.0):
+        raise ValueError("min_dominant_fraction must be between 0 and 1.")
+    top_n_labels = max(1, int(top_n_labels))
+
+    membership = clusters[[id_column, pseudo_column]].drop_duplicates().copy()
+    membership[id_column] = membership[id_column].astype(str)
+    membership[pseudo_column] = membership[pseudo_column].astype(str)
+    labels = label_table[[id_column, label_column]].drop_duplicates().copy()
+    labels[id_column] = labels[id_column].astype(str)
+    labels[label_column] = labels[label_column].astype(str)
+    merged = membership.merge(labels, on=id_column, how="left")
+
+    summary_rows = []
+    for pseudo_name, members in membership.groupby(pseudo_column, sort=False, dropna=False):
+        member_ids = members[id_column].astype(str).unique().tolist()
+        n_members = len(member_ids)
+        labelled = merged.loc[
+            merged[pseudo_column].astype(str).eq(str(pseudo_name))
+            & merged[label_column].notna(),
+            [id_column, label_column],
+        ].drop_duplicates()
+        n_labelled = int(labelled[id_column].nunique(dropna=True))
+        labelled_fraction = n_labelled / n_members if n_members else 0.0
+        dominant_label = pd.NA
+        dominant_count = 0
+        dominant_fraction = 0.0
+        top_labels = ""
+        if not labelled.empty:
+            label_counts = (
+                labelled.groupby(label_column, dropna=False)[id_column]
+                .nunique()
+                .reset_index(name="n_compounds")
+                .sort_values(["n_compounds", label_column], ascending=[False, True])
+            )
+            dominant_label = str(label_counts.iloc[0][label_column])
+            dominant_count = int(label_counts.iloc[0]["n_compounds"])
+            dominant_fraction = dominant_count / n_labelled if n_labelled else 0.0
+            top_labels = " | ".join(
+                f"{row[label_column]} ({int(row['n_compounds'])})"
+                for _, row in label_counts.head(top_n_labels).iterrows()
+            )
+
+        if n_labelled == 0:
+            final_label = str(pseudo_name)
+            label_status = "unlabelled"
+        elif labelled_fraction >= min_labelled_fraction and dominant_fraction >= min_dominant_fraction:
+            final_label = str(dominant_label)
+            label_status = "phenotype_labelled"
+        else:
+            final_label = str(pseudo_name)
+            label_status = "weak_or_mixed_label"
+
+        summary_rows.append(
+            {
+                pseudo_column: str(pseudo_name),
+                final_column: final_label,
+                "label_status": label_status,
+                "n_compounds": n_members,
+                "n_labelled_compounds": n_labelled,
+                "labelled_fraction": float(labelled_fraction),
+                "dominant_phenotype": dominant_label,
+                "dominant_phenotype_count": dominant_count,
+                "dominant_phenotype_fraction_of_labelled": float(dominant_fraction),
+                "top_phenotype_labels": top_labels,
+            }
+        )
+
+    label_summary = pd.DataFrame(summary_rows)
+    labelled_anchors = anchors.merge(
+        label_summary,
+        on=pseudo_column,
+        how="left",
+        validate="many_to_one",
+    )
+    labelled_clusters = clusters.merge(
+        label_summary,
+        on=pseudo_column,
+        how="left",
+        validate="many_to_one",
+    )
+    return labelled_anchors, labelled_clusters, label_summary
 
 
 def build_moa_centroids(
@@ -751,8 +1003,10 @@ def pairwise_distance_outputs(
     for metric in metrics:
         if metric == "spearman":
             ranks = pd.DataFrame(x).rank(axis=1, method="average").to_numpy(dtype=float)
+            require_sklearn_stack(purpose="pairwise distance outputs")
             dist = pairwise_distances(ranks, metric="correlation")
         else:
+            require_sklearn_stack(purpose="pairwise distance outputs")
             dist = pairwise_distances(x, metric=metric)
         dist = np.where(np.isfinite(dist), dist, 1.0)
         np.fill_diagonal(dist, 0.0)
@@ -854,6 +1108,7 @@ def plot_score_heatmap(
     row_order = np.arange(values.shape[0])
     if values.shape[0] >= 3:
         try:
+            require_scipy_stack(purpose="clustered heatmap ordering")
             dist = pdist(values, metric="cosine")
             row_order = leaves_list(linkage(dist, method="average"))
         except Exception:
@@ -914,6 +1169,7 @@ def project_embedding_with_centroids(
     split = x.shape[0]
     method = method.lower()
     if method == "pca":
+        require_sklearn_stack(purpose="MOA centroid PCA projection")
         model = PCA(n_components=2, random_state=random_state)
         coords = model.fit_transform(stacked)
     elif method == "umap":

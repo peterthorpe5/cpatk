@@ -20,7 +20,9 @@ from cpatk.moa import (
 from cpatk.moa_advanced import (
     anchor_permutation_test,
     build_moa_centroids,
+    label_pseudo_anchor_clusters,
     make_pseudo_anchors,
+    normalise_phenotype_label_table,
     pairwise_distance_outputs,
     plot_k_selection,
     plot_prediction_score_distribution,
@@ -95,6 +97,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k_values", default="8,12,16,24,32")
     parser.add_argument("--n_bootstraps", type=int, default=50)
     parser.add_argument("--subsample_fraction", type=float, default=0.8)
+
+    parser.add_argument(
+        "--pseudo_anchor_label_table",
+        default=None,
+        help=(
+            "Optional compound-to-phenotype table used to annotate pseudo-anchor "
+            "clusters and create a conservative final MOA label column."
+        ),
+    )
+    parser.add_argument("--pseudo_anchor_label_id_column", default="cpd_id")
+    parser.add_argument("--pseudo_anchor_label_column", default="label")
+    parser.add_argument(
+        "--pseudo_anchor_label_split_regex",
+        default=None,
+        help=(
+            "Optional regular expression for splitting multi-label phenotype cells. "
+            "Omit to preserve each cell as one curated label."
+        ),
+    )
+    parser.add_argument("--pseudo_anchor_final_moa_column", default="moa_final")
+    parser.add_argument("--pseudo_anchor_label_min_labelled_fraction", type=float, default=0.2)
+    parser.add_argument("--pseudo_anchor_label_min_dominant_fraction", type=float, default=0.5)
+    parser.add_argument("--pseudo_anchor_label_top_n", type=int, default=3)
+    parser.add_argument(
+        "--annotate_pseudo_anchors_only",
+        action="store_true",
+        help=(
+            "Annotate pseudo-anchor clusters with phenotype labels but keep "
+            "pseudo_moa as the centroid-scoring label."
+        ),
+    )
 
     parser.add_argument(
         "--aggregate_method",
@@ -330,6 +363,47 @@ def main() -> None:
             random_state=args.random_state,
         )
         anchor_moa_column = "pseudo_moa"
+        if args.pseudo_anchor_label_table:
+            label_raw = read_table(path=args.pseudo_anchor_label_table, logger=logger)
+            label_table, label_audit = normalise_phenotype_label_table(
+                label_table=label_raw,
+                id_column=args.pseudo_anchor_label_id_column,
+                label_column=args.pseudo_anchor_label_column,
+                split_regex=args.pseudo_anchor_label_split_regex,
+            )
+            label_table = label_table.rename(
+                columns={
+                    args.pseudo_anchor_label_id_column: args.id_column,
+                    args.pseudo_anchor_label_column: "phenotype_label",
+                }
+            )
+            anchors, clusters, label_summary = label_pseudo_anchor_clusters(
+                anchors=anchors,
+                clusters=clusters,
+                label_table=label_table,
+                id_column=args.id_column,
+                label_column="phenotype_label",
+                pseudo_column="pseudo_moa",
+                final_column=args.pseudo_anchor_final_moa_column,
+                min_labelled_fraction=args.pseudo_anchor_label_min_labelled_fraction,
+                min_dominant_fraction=args.pseudo_anchor_label_min_dominant_fraction,
+                top_n_labels=args.pseudo_anchor_label_top_n,
+            )
+            tables["pseudo_anchor_phenotype_labels"] = label_table
+            tables["pseudo_anchor_phenotype_label_audit"] = label_audit
+            tables["pseudo_anchor_phenotype_summary"] = label_summary
+            if not args.annotate_pseudo_anchors_only:
+                anchor_moa_column = args.pseudo_anchor_final_moa_column
+            warnings.append(
+                "Pseudo-anchor phenotype labels are interpretive annotations based on the "
+                "supplied compound-to-phenotype table. Weakly labelled or mixed clusters "
+                "retain their pseudo-anchor identifiers as final labels."
+            )
+            logger.info(
+                "Annotated pseudo-anchors with phenotype labels from %s; scoring column: %s.",
+                args.pseudo_anchor_label_table,
+                anchor_moa_column,
+            )
         tables["pseudo_anchors"] = anchors
         tables["pseudo_anchor_summary"] = anchor_summary
         tables["pseudo_anchor_clusters"] = clusters

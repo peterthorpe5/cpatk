@@ -2,7 +2,7 @@
 
 CPATK is a generic, extensible toolkit for Cell Painting / high-content profiling analysis. It supports defensive preprocessing, QC, classical analysis, optional CLIPn/AI integration, replicate and cluster stability, batch/domain-shift diagnostics, MOA classification, feature attribution and HTML/Excel reporting.
 
-Version: **0.2.12**
+Version: **0.2.14**
 
 ## Design principles
 
@@ -30,7 +30,7 @@ python -m pip install pyarrow plotly umap-learn shap
 
 `pyarrow` enables Parquet output. Without it, CPATK falls back to `.tsv.gz` and logs the reason.
 
-## v0.2.12 release-hardening update
+## v0.2.14 release-hardening update
 
 This release is focused on making CPATK safer for production and publication workflows rather than adding a new analysis method. Key changes are:
 
@@ -102,10 +102,11 @@ docs/CPATK_METADATA_AND_ANNOTATION_GUIDE.md
 docs/CPATK_MULTI_PLATE_NORMALISATION_AND_BATCH_GUIDE.md
 docs/CPATK_REPLICATE_QC_GUIDE.md
 docs/CPATK_CLIPN_GUIDE.md
+docs/CPATK_PHENOTYPE_LABELLED_MOA_GUIDE.md
 docs/CPATK_NEXT_CODE_PASS_RECOMMENDATIONS.md
 ```
 
-The most important production caveat at v0.2.12 is multi-plate CellProfiler export handling. CPATK can analyse multi-plate profile tables once each row has reliable `Metadata_Plate` and `Metadata_Well` values, and `cpatk-preprocess` already supports per-plate DMSO/reference normalisation with `--reference_group_columns Metadata_Plate`. However, if several independent CellProfiler exports are placed in one folder and `ImageNumber` restarts at 1 for each plate/export, v0.2.12 should not be treated as fully native multi-plate folder merging. In that case, build profiles per plate/export first, preserve plate provenance, then combine the resulting profile tables before one joint preprocessing pass. Native composite-key multi-plate folder merging should be the next code pass.
+The most important production caveat at v0.2.14 is multi-plate CellProfiler export handling. CPATK can analyse multi-plate profile tables once each row has reliable `Metadata_Plate` and `Metadata_Well` values, and `cpatk-preprocess` already supports per-plate DMSO/reference normalisation with `--reference_group_columns Metadata_Plate`. However, if several independent CellProfiler exports are placed in one folder and `ImageNumber` restarts at 1 for each plate/export, v0.2.14 should not be treated as fully native multi-plate folder merging. In that case, build profiles per plate/export first, preserve plate provenance, then combine the resulting profile tables before one joint preprocessing pass. Native composite-key multi-plate folder merging should be the next code pass.
 
 ## Command-line tools
 
@@ -294,6 +295,20 @@ cpatk-moa \
 
 Outputs include centroid scores, top predictions, leave-one-out centroid validation, optional KNN predictions, confidence plots, Excel summary and `moa_report.html`.
 
+Pseudo-anchor clusters can also be annotated using a curated compound-to-phenotype table. CPATK writes phenotype-label audits and a conservative `moa_final` column. Weakly labelled or mixed clusters retain their pseudo-anchor IDs rather than being over-interpreted.
+
+```bash
+cpatk-moa \
+  --input_table results/02_preprocess/preprocessed.tsv.gz \
+  --output_dir results/09_moa \
+  --id_column cpd_id \
+  --make_pseudo_anchors \
+  --pseudo_anchor_label_table cpd_id_to_phenotype.tsv \
+  --pseudo_anchor_label_id_column cpd_id \
+  --pseudo_anchor_label_column label \
+  --pseudo_anchor_final_moa_column moa_final
+```
+
 ## Supervised ML classifiers
 
 ```bash
@@ -348,7 +363,7 @@ docs/CPATK_v0_2_5_merge_first_preprocessing_audit.md
 
 ## Test status
 
-The v0.2.12 package passed full unittest discovery in this sandbox with native numerical thread limits set:
+The v0.2.14 package passed full unittest discovery in this sandbox with native numerical thread limits set:
 
 ```text
 Ran 163 tests
@@ -575,7 +590,7 @@ Donor / CellLine / Timepoint where relevant
 ```
 
 
-## v0.2.12 multi-plate and batch-correction additions
+## v0.2.14 multi-plate and batch-correction additions
 
 CPATK now includes safer native support for multi-plate CellProfiler workflows:
 

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from cpatk.neighbour_analysis import (
+    _try_gaussian_kde_density,
     evaluate_neighbour_overlap,
     normalise_neighbour_long_table,
     rank_biased_overlap,
@@ -184,6 +186,22 @@ class TestDriftQCV029(unittest.TestCase):
 
 class TestNeighbourAnalysisV029(unittest.TestCase):
     """Tests for nearest-neighbour utilities."""
+
+    def test_kde_density_is_optional(self) -> None:
+        """KDE density colouring should degrade gracefully if SciPy cannot import."""
+        original_import = __import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "scipy.stats":
+                raise ImportError("simulated scipy.stats import failure")
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=guarded_import):
+            density = _try_gaussian_kde_density(
+                x=np.asarray([0.1, 0.2, 0.3]),
+                y=np.asarray([0.2, 0.3, 0.4]),
+            )
+        self.assertIsNone(density)
 
     def test_normalise_long_table(self) -> None:
         """Column aliases should be normalised."""

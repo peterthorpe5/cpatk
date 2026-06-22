@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# CPATK multi-plate recommended workflow, v0.2.12.
+# CPATK multi-plate recommended workflow, v0.2.13.
 # This shell intentionally keeps the current safest workflow explicit:
 #   1. validate metadata once;
 #   2. build profiles per plate/export;
@@ -9,7 +9,7 @@ set -euo pipefail
 #   4. run one joint preprocessing pass with optional per-plate DMSO normalisation;
 #   5. run replicate QC and batch diagnostics.
 #
-# Note: v0.2.12 does not yet include native cpatk-combine-profiles. If your
+# Note: v0.2.13 does not yet include native cpatk-combine-profiles. If your
 # CellProfiler ImageNumber restarts per plate/export, do not pool raw exports
 # into one input folder and rely on ImageNumber alone.
 

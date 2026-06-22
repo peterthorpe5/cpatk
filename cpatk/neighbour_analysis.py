@@ -8,7 +8,6 @@ from typing import Optional, Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.stats import gaussian_kde
 
 from cpatk.io import read_table, write_excel_workbook, write_table
 from cpatk.plotting import save_current_figure
@@ -25,6 +24,22 @@ NEIGHBOUR_CANDIDATES = (
 )
 RANK_CANDIDATES = ("rank", "Rank", "neighbour_rank", "nn_rank", "k")
 DISTANCE_CANDIDATES = ("distance", "Distance", "cosine_distance", "euclidean_distance")
+
+
+def _try_gaussian_kde_density(*, x: np.ndarray, y: np.ndarray) -> Optional[np.ndarray]:
+    """Return KDE point density when SciPy is available, otherwise None.
+
+    Some HPC environments expose an older system ``libstdc++`` before the
+    conda environment library path. In that case importing ``scipy.stats`` can
+    fail even when SciPy is installed. KDE colouring is optional, so CPATK
+    should still import and plot a plain scatter in that situation.
+    """
+    try:
+        from scipy.stats import gaussian_kde  # type: ignore
+
+        return gaussian_kde(np.vstack([x, y]))(np.vstack([x, y]))
+    except Exception:
+        return None
 
 
 def detect_column(*, data_frame: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
@@ -320,12 +335,12 @@ def plot_shared_neighbours(
     y = shared["second_similarity"].to_numpy(dtype=float)
     plt.figure(figsize=(6, 6))
     if x.size >= 3 and np.nanstd(x) > 0 and np.nanstd(y) > 0:
-        try:
-            density = gaussian_kde(np.vstack([x, y]))(np.vstack([x, y]))
+        density = _try_gaussian_kde_density(x=x, y=y)
+        if density is not None:
             order = np.argsort(density)
             plt.scatter(x[order], y[order], c=density[order], s=48)
             plt.colorbar(label="Density")
-        except Exception:
+        else:
             plt.scatter(x, y, s=48)
     else:
         plt.scatter(x, y, s=48)
