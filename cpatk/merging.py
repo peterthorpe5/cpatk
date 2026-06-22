@@ -229,13 +229,44 @@ def _aggregate_object_table(
     table_label: str,
     statistic: str = "median",
     include_qc_numeric_features: bool = False,
+    group_keys: Optional[Sequence[str]] = None,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Aggregate one object-level table to image-level profiles."""
-    if "ImageNumber" not in data_frame.columns:
-        raise ValueError("Object table does not contain ImageNumber.")
-    metadata_columns = infer_metadata_columns(data_frame=data_frame, additional_metadata_columns=["ImageNumber", "ObjectNumber"])
-    for identifier in ["ImageNumber", "ObjectNumber", "Number_Object_Number"]:
+    """Aggregate one object-level table to image-level profiles.
+
+    Parameters
+    ----------
+    data_frame:
+        Object-level CellProfiler table.
+    table_label:
+        Prefix used for aggregated feature names.
+    statistic:
+        Aggregation statistic, either ``median`` or ``mean``.
+    include_qc_numeric_features:
+        Whether to allow numeric QC/count features as biological features.
+    group_keys:
+        Keys defining one image/profile. Multi-plate projects should usually
+        use ``Metadata_Plate`` + ``ImageNumber`` rather than ``ImageNumber``
+        alone.
+    logger:
+        Optional logger.
+
+    Returns
+    -------
+    tuple[pandas.DataFrame, pandas.DataFrame]
+        Aggregated image-level table and an audit report.
+    """
+    group_keys = list(group_keys or ["ImageNumber"])
+    missing_keys = [key for key in group_keys if key not in data_frame.columns]
+    if missing_keys:
+        raise ValueError(f"Object table {table_label} is missing merge keys: {missing_keys}")
+    if "ImageNumber" not in group_keys:
+        raise ValueError("Object aggregation keys must include ImageNumber.")
+    metadata_columns = infer_metadata_columns(
+        data_frame=data_frame,
+        additional_metadata_columns=[*group_keys, "ObjectNumber"],
+    )
+    for identifier in [*group_keys, "ObjectNumber", "Number_Object_Number"]:
         if identifier in data_frame.columns and identifier not in metadata_columns:
             metadata_columns.append(identifier)
     feature_columns = infer_feature_columns(
@@ -245,10 +276,10 @@ def _aggregate_object_table(
     )
     if not feature_columns:
         raise ValueError(f"No object-level feature columns were found in {table_label}.")
-    features = data_frame[["ImageNumber", *feature_columns]].copy()
+    features = data_frame[[*group_keys, *feature_columns]].copy()
     for feature in feature_columns:
         features[feature] = pd.to_numeric(features[feature], errors="coerce")
-    grouped = features.groupby("ImageNumber", dropna=False)
+    grouped = features.groupby(group_keys, dropna=False)
     if statistic == "median":
         aggregated = grouped.median(numeric_only=True).reset_index()
     elif statistic == "mean":
@@ -257,8 +288,8 @@ def _aggregate_object_table(
         raise ValueError("Object aggregation statistic must be 'median' or 'mean'.")
     rename_map = {feature: f"{table_label}__{feature}" for feature in feature_columns}
     aggregated = aggregated.rename(columns=rename_map)
-    object_counts = data_frame.groupby("ImageNumber", dropna=False).size().reset_index(name=f"{table_label}__n_objects")
-    aggregated = aggregated.merge(object_counts, on="ImageNumber", how="left", validate="one_to_one")
+    object_counts = data_frame.groupby(group_keys, dropna=False).size().reset_index(name=f"{table_label}__n_objects")
+    aggregated = aggregated.merge(object_counts, on=group_keys, how="left", validate="one_to_one")
     report = pd.DataFrame.from_records(
         [
             {
@@ -268,7 +299,7 @@ def _aggregate_object_table(
                 "n_feature_columns_aggregated": int(len(feature_columns)),
                 "n_image_profiles": int(aggregated.shape[0]),
                 "aggregation_statistic": statistic,
-                "merge_key": "ImageNumber",
+                "merge_key": ";".join(group_keys),
                 "object_merge_caution": (
                     "Object-level tables were aggregated to ImageNumber before merging. "
                     "CPATK did not merge separate object compartments by ObjectNumber."
@@ -345,23 +376,127 @@ def _collapse_duplicate_rows(
     return data_frame.drop_duplicates(subset=keys, keep="first").copy()
 
 
+def _parse_merge_key_list(value: Optional[Sequence[str] | str]) -> Optional[List[str]]:
+    """Parse an optional merge-key specification.
+
+    Parameters
+    ----------
+    value:
+        Sequence or comma/semicolon separated string of key names.
+
+    Returns
+    -------
+    list[str] or None
+        Parsed key names, or ``None`` when no keys were supplied.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parsed = parse_column_list(value=value)
+    else:
+        parsed = [str(item).strip() for item in value if str(item).strip()]
+    return parsed or None
+
+
+def choose_profile_merge_keys(
+    *,
+    left: pd.DataFrame,
+    right: Optional[pd.DataFrame] = None,
+    requested_keys: Optional[Sequence[str] | str] = None,
+    require_image_number: bool = True,
+) -> List[str]:
+    """Choose safe composite keys for image/profile table merging.
+
+    CellProfiler ``ImageNumber`` values are frequently unique only within one
+    export or plate.  For multi-plate projects CPATK therefore prefers a
+    composite key such as ``Metadata_Plate`` + ``ImageNumber`` when both sides
+    contain these columns.  Source/robot wells are deliberately not used here;
+    only assay/profile keys are considered.
+
+    Parameters
+    ----------
+    left:
+        Left table, usually the image/profile backbone.
+    right:
+        Optional right table to be merged onto ``left``.
+    requested_keys:
+        Explicit keys supplied by the user.
+    require_image_number:
+        Whether at least one selected key must be ``ImageNumber``.
+
+    Returns
+    -------
+    list[str]
+        Merge keys present in the required table(s).
+
+    Raises
+    ------
+    ValueError
+        If no safe keys can be selected or requested keys are absent.
+    """
+    requested = _parse_merge_key_list(requested_keys)
+    tables = [left] + ([right] if right is not None else [])
+    if requested:
+        missing = [
+            key
+            for key in requested
+            if any(key not in table.columns for table in tables)
+        ]
+        if missing:
+            raise ValueError(
+                f"Requested image/profile merge keys are missing from one or more tables: {missing}"
+            )
+        if require_image_number and "ImageNumber" not in requested:
+            raise ValueError("Image/profile merge keys must include ImageNumber.")
+        return list(requested)
+
+    candidate_sets = [
+        ["Metadata_Plate", "Metadata_Well", "ImageNumber"],
+        ["Metadata_Plate", "ImageNumber"],
+        ["ImageNumber"],
+    ]
+    for candidate in candidate_sets:
+        if all(all(key in table.columns for key in candidate) for table in tables):
+            if candidate == ["ImageNumber"]:
+                # Object-level right tables are expected to contain repeated
+                # ImageNumber values before aggregation. The unsafe case is a
+                # profile/image backbone with repeated ImageNumber values and
+                # no plate/export key to disambiguate them.
+                if left.duplicated(subset=candidate, keep=False).any():
+                    raise ValueError(
+                        "ImageNumber is duplicated in the profile backbone and no shared Metadata_Plate column is available. "
+                        "Build profiles per plate/export or ensure object and image tables contain an assay plate column."
+                    )
+            return list(candidate)
+    raise ValueError(
+        "Could not choose safe image/profile merge keys. Expected ImageNumber, ideally with Metadata_Plate for multi-plate exports."
+    )
+
+
+
 def _prepare_image_or_profile_table(
     *,
     data_frame: pd.DataFrame,
     table_label: str,
     include_qc_numeric_features: bool = False,
     duplicate_image_policy: str = "error",
+    image_merge_keys: Optional[Sequence[str] | str] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Prepare an image-level/profile table without object aggregation."""
     n_rows_input = int(data_frame.shape[0])
+    merge_keys = choose_profile_merge_keys(
+        left=data_frame,
+        requested_keys=image_merge_keys,
+        require_image_number="ImageNumber" in data_frame.columns,
+    ) if "ImageNumber" in data_frame.columns else []
     n_duplicate_image_rows = 0
-    if "ImageNumber" in data_frame.columns:
-        n_duplicate_image_rows = int(data_frame.duplicated(subset=["ImageNumber"], keep=False).sum())
+    if merge_keys:
+        n_duplicate_image_rows = int(data_frame.duplicated(subset=merge_keys, keep=False).sum())
         data_frame = _collapse_duplicate_rows(
             data_frame=data_frame,
-            keys=["ImageNumber"],
+            keys=merge_keys,
             duplicate_policy=duplicate_image_policy,
-            context="ImageNumber",
+            context="image/profile composite key",
         )
     report = pd.DataFrame.from_records(
         [
@@ -375,7 +510,8 @@ def _prepare_image_or_profile_table(
                 "contains_Metadata_Plate": bool("Metadata_Plate" in data_frame.columns),
                 "contains_Metadata_Well": bool("Metadata_Well" in data_frame.columns),
                 "duplicate_image_policy": duplicate_image_policy,
-                "note": "Image/profile table used as profile backbone. Duplicate ImageNumber rows fail by default unless an explicit permissive policy is chosen.",
+                "image_merge_keys": ";".join(merge_keys),
+                "note": "Image/profile table used as profile backbone. Duplicate composite-key rows fail by default unless an explicit permissive policy is chosen.",
             }
         ]
     )
@@ -486,6 +622,7 @@ def build_profiles_from_folder(
     include_qc_numeric_features: bool = False,
     duplicate_image_policy: str = "error",
     metadata_duplicate_policy: str = "error",
+    image_merge_keys: Optional[Sequence[str] | str] = None,
     logger: Optional[logging.Logger] = None,
 ) -> ProfileBuildResult:
     """Build an analysis-ready profile table from a folder of Cell Painting files.
@@ -513,6 +650,9 @@ def build_profiles_from_folder(
         Policy for duplicate ImageNumber rows in the backbone table: error, identical or first.
     metadata_duplicate_policy:
         Policy for duplicate external metadata keys: error, identical or first.
+    image_merge_keys:
+        Optional explicit image/object merge keys. Multi-plate projects often
+        require ``Metadata_Plate,ImageNumber``.
     logger:
         Optional logger.
 
@@ -551,6 +691,7 @@ def build_profiles_from_folder(
         table_label=_normalise_file_label(backbone_path),
         include_qc_numeric_features=include_qc_numeric_features,
         duplicate_image_policy=duplicate_image_policy,
+        image_merge_keys=image_merge_keys,
     )
 
     aggregation_reports: List[pd.DataFrame] = []
@@ -566,20 +707,31 @@ def build_profiles_from_folder(
         )
         column_report.insert(0, "table_label", table_label)
         object_column_reports.append(column_report)
+        object_merge_keys = choose_profile_merge_keys(
+            left=profiles,
+            right=object_clean,
+            requested_keys=image_merge_keys,
+            require_image_number=True,
+        )
         aggregated, report = _aggregate_object_table(
             data_frame=object_clean,
             table_label=table_label,
             statistic=aggregate_statistic,
             include_qc_numeric_features=include_qc_numeric_features,
+            group_keys=object_merge_keys,
             logger=logger,
         )
         aggregation_reports.append(report)
-        if "ImageNumber" not in profiles.columns:
-            raise ValueError("Cannot merge object tables because the profile backbone lacks ImageNumber.")
         before_rows = profiles.shape[0]
-        profiles = profiles.merge(aggregated, on="ImageNumber", how="left", validate="one_to_one")
+        profiles = profiles.merge(aggregated, on=object_merge_keys, how="left", validate="one_to_one")
         if logger is not None:
-            logger.info("Merged object aggregate %s: %s -> %s rows", table_label, before_rows, profiles.shape[0])
+            logger.info(
+                "Merged object aggregate %s on %s: %s -> %s rows",
+                table_label,
+                ";".join(object_merge_keys),
+                before_rows,
+                profiles.shape[0],
+            )
 
     metadata_reports: List[pd.DataFrame] = []
     explicit_metadata_paths = parse_column_list(value=metadata_table) if metadata_table else None
@@ -615,6 +767,7 @@ def build_profiles_from_folder(
             {"item": "object_aggregation_statistic", "value": aggregate_statistic},
             {"item": "duplicate_image_policy", "value": duplicate_image_policy},
             {"item": "metadata_duplicate_policy", "value": metadata_duplicate_policy},
+            {"item": "image_merge_keys", "value": ";".join(_parse_merge_key_list(image_merge_keys) or [])},
             {"item": "external_metadata_tables", "value": ";".join(str(path) for path in metadata_paths)},
             {"item": "n_profiles", "value": int(profiles.shape[0])},
             {"item": "n_columns", "value": int(profiles.shape[1])},

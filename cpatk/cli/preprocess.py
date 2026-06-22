@@ -56,6 +56,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="When --input_dir is used, policy for duplicate metadata keys. Default: error.",
     )
     parser.add_argument(
+        "--image_merge_keys",
+        default=None,
+        help=(
+            "When --input_dir is used, optional comma-separated image/object merge keys. "
+            "Use Metadata_Plate,ImageNumber for independent multi-plate CellProfiler exports."
+        ),
+    )
+    parser.add_argument(
         "--imputation_method",
         default="median",
         choices=["median", "mean", "zero", "knn", "group_median", "group_mean"],
@@ -77,6 +85,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference_group_columns", default=None)
     parser.add_argument("--batch_centering_method", default="none", choices=["none", "median_center", "mean_center"])
     parser.add_argument("--batch_centering_columns", default=None)
+    parser.add_argument(
+        "--batch_correction_method",
+        default="none",
+        choices=["none", "combat_location_scale"],
+        help="Optional ComBat-style location/scale batch correction. Disabled by default.",
+    )
+    parser.add_argument("--batch_column", default=None, help="Batch column for ComBat-style correction, for example Metadata_Plate.")
+    parser.add_argument(
+        "--batch_protect_columns",
+        default=None,
+        help="Comma-separated biological/protected columns for batch-confounding checks, for example Metadata_Compound,Metadata_MOA.",
+    )
+    parser.add_argument("--batch_correction_min_batch_size", type=int, default=3)
+    parser.add_argument(
+        "--replicate_group_columns",
+        default=None,
+        help="Comma-separated columns defining replicate groups for before/after QC, for example Metadata_Compound,Metadata_Dose.",
+    )
+    parser.add_argument(
+        "--batch_report_columns",
+        default=None,
+        help="Comma-separated metadata columns for before/after PC association checks, for example Metadata_Plate,Metadata_Batch.",
+    )
     parser.add_argument("--max_missing_indicators", type=int, default=500)
     parser.add_argument("--scaling_method", default="robust", choices=["robust", "standard", "minmax", "none"])
     parser.add_argument("--max_feature_missing_fraction", type=float, default=0.2)
@@ -236,8 +267,13 @@ def _write_html_report(
             "Final matrix validation": result.get("final_matrix_validation", pd.DataFrame()),
             "Preprocessing decisions": result["preprocessing_decision_log"],
             "Preprocessing config": result["preprocessing_config"],
+            "Reference control QC before normalisation": result.get("reference_control_qc_before_normalisation", pd.DataFrame()),
             "Reference normalisation report": result["reference_normalisation_report"].head(2000),
             "Batch centering report": result["batch_centering_report"].head(2000),
+            "Batch correction report": result.get("batch_correction_report", pd.DataFrame()).head(2000),
+            "Batch confounding report": result.get("batch_confounding_report", pd.DataFrame()),
+            "Before/after replicate summary": result.get("before_after_replicate_summary", pd.DataFrame()),
+            "Before/after batch PC association": result.get("before_after_batch_pc_association", pd.DataFrame()),
         },
         plot_paths=plot_paths,
         narrative=narrative,
@@ -274,6 +310,7 @@ def main() -> None:
             include_qc_numeric_features=args.include_qc_numeric_features,
             duplicate_image_policy=args.duplicate_image_policy,
             metadata_duplicate_policy=args.metadata_duplicate_policy,
+            image_merge_keys=args.image_merge_keys,
             logger=logger,
         )
         data_frame = profile_build.profiles
@@ -286,6 +323,9 @@ def main() -> None:
     reference_values = parse_column_list(value=args.reference_values)
     reference_group_columns = parse_column_list(value=args.reference_group_columns)
     batch_centering_columns = parse_column_list(value=args.batch_centering_columns)
+    batch_protect_columns = parse_column_list(value=args.batch_protect_columns)
+    replicate_group_columns = parse_column_list(value=args.replicate_group_columns)
+    batch_report_columns = parse_column_list(value=args.batch_report_columns)
 
     if args.aggregate_by:
         group_columns = parse_column_list(value=args.aggregate_by)
@@ -331,6 +371,12 @@ def main() -> None:
         reference_group_columns=reference_group_columns,
         batch_centering_method=args.batch_centering_method,
         batch_centering_columns=batch_centering_columns,
+        batch_correction_method=args.batch_correction_method,
+        batch_column=args.batch_column,
+        batch_protect_columns=batch_protect_columns,
+        batch_correction_min_batch_size=args.batch_correction_min_batch_size,
+        replicate_group_columns=replicate_group_columns,
+        batch_report_columns=batch_report_columns,
         scaling_method=args.scaling_method,
         standardise_metadata=not args.disable_metadata_standardisation,
         drop_unnamed_indexes=not args.keep_unnamed_index_columns,

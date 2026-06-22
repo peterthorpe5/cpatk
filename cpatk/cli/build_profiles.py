@@ -42,6 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["error", "identical", "first"],
         help="Policy for duplicate plate/well rows in external metadata. Default: error.",
     )
+    parser.add_argument(
+        "--image_merge_keys",
+        default=None,
+        help=(
+            "Optional comma-separated keys for image/object merging. "
+            "Use Metadata_Plate,ImageNumber for independent multi-plate exports where ImageNumber restarts."
+        ),
+    )
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser
 
@@ -64,6 +72,7 @@ def main() -> None:
         include_qc_numeric_features=args.include_qc_numeric_features,
         duplicate_image_policy=args.duplicate_image_policy,
         metadata_duplicate_policy=args.metadata_duplicate_policy,
+        image_merge_keys=args.image_merge_keys,
         logger=logger,
     )
     logger.info("CPATK profile building complete")

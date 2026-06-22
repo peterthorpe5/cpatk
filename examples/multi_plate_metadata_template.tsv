@@ -1,0 +1,7 @@
+Metadata_Plate	Metadata_Well	Metadata_Source_Plate	Metadata_Source_Well	Metadata_Compound	cpd_type	Metadata_MOA	Metadata_Dose	Metadata_Batch	Metadata_Replicate	Notes
+ASSAY_PLATE_01	A01	LIBRARY_PLATE_01	A01	DMSO	control	vehicle	0	batch_01	1	DMSO control
+ASSAY_PLATE_01	A02	LIBRARY_PLATE_01	A02	POS_CTRL_01	positive_control	known_positive	10	batch_01	1	Positive control
+ASSAY_PLATE_01	B01	LIBRARY_PLATE_01	B01	CMPD_001	test	unknown	10	batch_01	1	Test compound
+ASSAY_PLATE_02	A01	LIBRARY_PLATE_01	A01	DMSO	control	vehicle	0	batch_02	2	DMSO control
+ASSAY_PLATE_02	A02	LIBRARY_PLATE_01	A02	POS_CTRL_01	positive_control	known_positive	10	batch_02	2	Positive control repeated across plate
+ASSAY_PLATE_02	B01	LIBRARY_PLATE_01	B01	CMPD_001	test	unknown	10	batch_02	2	Test compound repeated across plate

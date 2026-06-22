@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cpatk"
-version = "0.2.11"
+version = "0.2.12"
 description = "Cell Painting Analysis Toolkit for generic high-content profiling, QC, classical analysis, optional AI integration, MOA classification and reporting."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -31,6 +31,7 @@ all = ["plotly>=5.0", "umap-learn>=0.5", "pyarrow>=10.0", "shap>=0.41", "phate>=
 cpatk-inspect = "cpatk.cli.inspect:main"
 cpatk-preprocess = "cpatk.cli.preprocess:main"
 cpatk-build-profiles = "cpatk.cli.build_profiles:main"
+cpatk-combine-profiles = "cpatk.cli.combine_profiles:main"
 cpatk-classical = "cpatk.cli.classical:main"
 cpatk-moa = "cpatk.cli.moa:main"
 cpatk-report = "cpatk.cli.report:main"

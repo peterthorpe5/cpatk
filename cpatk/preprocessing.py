@@ -24,6 +24,7 @@ from cpatk.metadata import (
     normalise_column_names,
     standardise_metadata_aliases,
 )
+from cpatk.reproducibility import calculate_replicate_correlations, summarise_replicate_correlations
 from cpatk.qc import (
     calculate_feature_qc,
     calculate_sample_qc,
@@ -504,6 +505,418 @@ def batch_center_features(
     return output, pd.DataFrame.from_records(records)
 
 
+def calculate_reference_control_qc(
+    *,
+    features: pd.DataFrame,
+    metadata: pd.DataFrame,
+    reference_column: Optional[str],
+    reference_values: Optional[Sequence[str]],
+    group_columns: Optional[Sequence[str]] = None,
+    method: str = "none",
+    epsilon: float = 1e-8,
+) -> pd.DataFrame:
+    """Summarise reference/control profiles before normalisation.
+
+    Parameters
+    ----------
+    features:
+        Feature matrix before reference normalisation.
+    metadata:
+        Metadata aligned to ``features``.
+    reference_column:
+        Metadata column identifying controls, for example ``Metadata_Compound``.
+    reference_values:
+        Values treated as reference controls, for example ``DMSO``.
+    group_columns:
+        Optional grouping columns, usually ``Metadata_Plate`` for per-plate
+        normalisation.
+    method:
+        Requested reference normalisation method.
+    epsilon:
+        Small value below which a robust scale is considered zero.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Per-group control-count and scale-quality report.
+    """
+    columns = [
+        "group",
+        "status",
+        "method",
+        "reference_column",
+        "reference_values",
+        "n_profiles",
+        "n_reference_profiles",
+        "reference_fraction",
+        "n_features",
+        "n_features_zero_or_near_zero_mad",
+        "fraction_features_zero_or_near_zero_mad",
+        "median_reference_missing_fraction",
+    ]
+    if method.lower() == "none":
+        return pd.DataFrame(columns=columns)
+    if reference_column is None or not reference_values:
+        return pd.DataFrame.from_records(
+            [
+                {
+                    "group": "__all__",
+                    "status": "not_tested_missing_reference_definition",
+                    "method": method,
+                    "reference_column": str(reference_column),
+                    "reference_values": ";".join(reference_values or []),
+                    "n_profiles": int(features.shape[0]),
+                    "n_reference_profiles": 0,
+                    "reference_fraction": 0.0,
+                    "n_features": int(features.shape[1]),
+                    "n_features_zero_or_near_zero_mad": 0,
+                    "fraction_features_zero_or_near_zero_mad": 0.0,
+                    "median_reference_missing_fraction": float("nan"),
+                }
+            ]
+        )
+    if reference_column not in metadata.columns:
+        raise ValueError(f"Reference column is missing from metadata: {reference_column}")
+    valid_groups = [column for column in (group_columns or []) if column in metadata.columns]
+    aligned_metadata = metadata.reset_index(drop=True)
+    aligned_features = features.reset_index(drop=True)
+    reference_set = {str(value) for value in reference_values}
+    if valid_groups:
+        group_series = aligned_metadata.loc[:, valid_groups].astype(str).agg("|".join, axis=1)
+    else:
+        group_series = pd.Series(["__all__"] * aligned_metadata.shape[0])
+    records = []
+    ref_mask_all = aligned_metadata[reference_column].astype(str).isin(reference_set)
+    for group_name, row_index in group_series.groupby(group_series, dropna=False).groups.items():
+        rows = list(row_index)
+        group_ref = ref_mask_all.iloc[rows].to_numpy(dtype=bool)
+        n_ref = int(group_ref.sum())
+        ref_features = aligned_features.iloc[rows, :].loc[group_ref, :]
+        if n_ref == 0:
+            status = "failed_no_reference_profiles"
+            n_zero_mad = 0
+            median_missing = float("nan")
+        else:
+            mad = ref_features.apply(
+                lambda values: (pd.to_numeric(values, errors="coerce") - pd.to_numeric(values, errors="coerce").median(skipna=True)).abs().median(skipna=True),
+                axis=0,
+            )
+            n_zero_mad = int((mad.fillna(0.0).abs() <= epsilon).sum())
+            median_missing = float(ref_features.isna().mean(axis=0).median(skipna=True))
+            status = "ok" if n_ref >= 2 else "review_fewer_than_two_reference_profiles"
+        records.append(
+            {
+                "group": group_name,
+                "status": status,
+                "method": method,
+                "reference_column": reference_column,
+                "reference_values": ";".join(sorted(reference_set)),
+                "n_profiles": int(len(rows)),
+                "n_reference_profiles": n_ref,
+                "reference_fraction": float(n_ref / max(len(rows), 1)),
+                "n_features": int(aligned_features.shape[1]),
+                "n_features_zero_or_near_zero_mad": n_zero_mad,
+                "fraction_features_zero_or_near_zero_mad": float(n_zero_mad / max(aligned_features.shape[1], 1)),
+                "median_reference_missing_fraction": median_missing,
+            }
+        )
+    return pd.DataFrame.from_records(records, columns=columns)
+
+
+def assess_batch_confounding(
+    *,
+    metadata: pd.DataFrame,
+    batch_column: Optional[str],
+    protected_columns: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Assess whether biological labels are confounded with batch.
+
+    The report is deliberately conservative. It flags cases where a protected
+    label appears in only one batch, or where each batch contains only one value
+    for a protected label. Such designs make batch correction hard to interpret.
+    """
+    columns = [
+        "protected_column",
+        "status",
+        "batch_column",
+        "n_batches",
+        "n_labels",
+        "n_labels_observed_in_one_batch",
+        "n_batches_with_one_label",
+        "interpretation",
+    ]
+    if batch_column is None or batch_column not in metadata.columns:
+        return pd.DataFrame.from_records(
+            [
+                {
+                    "protected_column": "",
+                    "status": "not_tested_missing_batch_column",
+                    "batch_column": str(batch_column),
+                    "n_batches": 0,
+                    "n_labels": 0,
+                    "n_labels_observed_in_one_batch": 0,
+                    "n_batches_with_one_label": 0,
+                    "interpretation": "Batch correction was not assessed for confounding because no valid batch column was supplied.",
+                }
+            ]
+        )
+    protected = [column for column in (protected_columns or []) if column in metadata.columns and column != batch_column]
+    labels_batch = metadata[batch_column].astype(str)
+    n_batches = int(labels_batch.nunique(dropna=False))
+    if not protected:
+        return pd.DataFrame.from_records(
+            [
+                {
+                    "protected_column": "",
+                    "status": "not_tested_no_protected_columns",
+                    "batch_column": batch_column,
+                    "n_batches": n_batches,
+                    "n_labels": 0,
+                    "n_labels_observed_in_one_batch": 0,
+                    "n_batches_with_one_label": 0,
+                    "interpretation": "No biological/protected columns were supplied for confounding assessment.",
+                }
+            ]
+        )
+    records = []
+    for column in protected:
+        labels = metadata[column].astype(str)
+        batches_per_label = labels_batch.groupby(labels, dropna=False).nunique(dropna=False)
+        labels_in_one_batch = int((batches_per_label <= 1).sum())
+        labels_per_batch = labels.groupby(labels_batch, dropna=False).nunique(dropna=False)
+        batches_with_one_label = int((labels_per_batch <= 1).sum())
+        if labels_in_one_batch == int(labels.nunique(dropna=False)) or batches_with_one_label == n_batches:
+            status = "high_risk_confounded"
+        elif labels_in_one_batch > 0 or batches_with_one_label > 0:
+            status = "review_partial_confounding"
+        else:
+            status = "ok_mixed_design"
+        records.append(
+            {
+                "protected_column": column,
+                "status": status,
+                "batch_column": batch_column,
+                "n_batches": n_batches,
+                "n_labels": int(labels.nunique(dropna=False)),
+                "n_labels_observed_in_one_batch": labels_in_one_batch,
+                "n_batches_with_one_label": batches_with_one_label,
+                "interpretation": (
+                    "High-risk confounding means batch correction may remove biology or fail to remove batch. "
+                    "Prefer balanced designs and inspect before/after QC."
+                ),
+            }
+        )
+    return pd.DataFrame.from_records(records, columns=columns)
+
+
+def combat_style_location_scale_correction(
+    *,
+    features: pd.DataFrame,
+    metadata: pd.DataFrame,
+    batch_column: Optional[str],
+    protected_columns: Optional[Sequence[str]] = None,
+    method: str = "none",
+    min_batch_size: int = 3,
+    epsilon: float = 1e-8,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Apply optional ComBat-style location/scale batch correction.
+
+    This is an auditable location/scale harmonisation inspired by the practical
+    goal of ComBat: adjust feature distributions across batches while retaining
+    a global feature scale. It is not an empirical-Bayes implementation and the
+    report names it clearly as ``combat_location_scale``.
+    """
+    method = method.lower()
+    empty_report = pd.DataFrame(columns=["batch", "feature", "status", "method"])
+    confounding = assess_batch_confounding(
+        metadata=metadata,
+        batch_column=batch_column,
+        protected_columns=protected_columns,
+    )
+    if method == "none":
+        return features.copy(), empty_report, confounding
+    if method != "combat_location_scale":
+        raise ValueError("batch_correction_method must be none or combat_location_scale.")
+    if batch_column is None or batch_column not in metadata.columns:
+        raise ValueError("combat_location_scale correction requires a valid batch_column.")
+    if min_batch_size < 2:
+        raise ValueError("min_batch_size must be at least 2 for batch correction.")
+    output = features.copy()
+    numeric = features.apply(pd.to_numeric, errors="coerce")
+    global_centre = numeric.mean(axis=0, skipna=True)
+    global_scale = numeric.std(axis=0, skipna=True).replace(0.0, 1.0).fillna(1.0)
+    batches = metadata[batch_column].astype(str).reset_index(drop=True)
+    records = []
+    for batch, row_index in batches.groupby(batches, dropna=False).groups.items():
+        rows = list(row_index)
+        if len(rows) < min_batch_size:
+            for feature in numeric.columns:
+                records.append(
+                    {
+                        "batch": batch,
+                        "feature": feature,
+                        "status": "skipped_small_batch",
+                        "method": method,
+                        "n_batch_profiles": int(len(rows)),
+                        "batch_centre": float("nan"),
+                        "batch_scale": float("nan"),
+                        "global_centre": float(global_centre[feature]) if pd.notna(global_centre[feature]) else float("nan"),
+                        "global_scale": float(global_scale[feature]) if pd.notna(global_scale[feature]) else float("nan"),
+                    }
+                )
+            continue
+        block = numeric.iloc[rows, :]
+        batch_centre = block.mean(axis=0, skipna=True)
+        batch_scale = block.std(axis=0, skipna=True)
+        for feature in numeric.columns:
+            scale = batch_scale[feature]
+            status = "ok"
+            if pd.isna(scale) or abs(float(scale)) <= epsilon:
+                scale = 1.0
+                status = "ok_scale_replaced_by_one"
+            adjusted = ((block[feature] - batch_centre[feature]) / float(scale)) * global_scale[feature] + global_centre[feature]
+            output.loc[rows, feature] = adjusted.to_numpy()
+            records.append(
+                {
+                    "batch": batch,
+                    "feature": feature,
+                    "status": status,
+                    "method": method,
+                    "n_batch_profiles": int(len(rows)),
+                    "batch_centre": float(batch_centre[feature]) if pd.notna(batch_centre[feature]) else float("nan"),
+                    "batch_scale": float(scale),
+                    "global_centre": float(global_centre[feature]) if pd.notna(global_centre[feature]) else float("nan"),
+                    "global_scale": float(global_scale[feature]) if pd.notna(global_scale[feature]) else float("nan"),
+                }
+            )
+    if logger is not None:
+        logger.info("ComBat-style location/scale batch correction method=%s complete", method)
+    return output, pd.DataFrame.from_records(records), confounding
+
+
+def _summarise_stage_replicates(
+    *,
+    stage: str,
+    features: pd.DataFrame,
+    metadata: pd.DataFrame,
+    replicate_group_columns: Optional[Sequence[str]],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Calculate replicate-pair and replicate-summary tables for one stage."""
+    valid = [column for column in (replicate_group_columns or []) if column in metadata.columns]
+    if not valid:
+        empty_pairs = pd.DataFrame(columns=["stage", "replicate_group", "correlation"])
+        empty_summary = pd.DataFrame.from_records(
+            [{"stage": stage, "status": "not_tested_no_valid_replicate_group_columns"}]
+        )
+        return empty_pairs, empty_summary
+    pairs = calculate_replicate_correlations(
+        features=features,
+        metadata=metadata,
+        replicate_group_columns=valid,
+    )
+    if not pairs.empty:
+        pairs.insert(0, "stage", stage)
+    summary = summarise_replicate_correlations(
+        replicate_correlations=pairs.drop(columns=["stage"], errors="ignore"),
+        group_columns=valid,
+    )
+    if summary.empty:
+        summary = pd.DataFrame.from_records([{column: "" for column in valid}])
+        summary["status"] = "not_tested_no_groups_with_replicates"
+    summary.insert(0, "stage", stage)
+    return pairs, summary
+
+
+def _summarise_stage_batch_association(
+    *,
+    stage: str,
+    features: pd.DataFrame,
+    metadata: pd.DataFrame,
+    batch_report_columns: Optional[Sequence[str]],
+) -> pd.DataFrame:
+    """Summarise simple PC1/PC2 association with batch/report columns."""
+    valid = [column for column in (batch_report_columns or []) if column in metadata.columns]
+    if not valid:
+        return pd.DataFrame.from_records(
+            [{"stage": stage, "metadata_column": "", "status": "not_tested_no_valid_batch_report_columns"}]
+        )
+    numeric = features.apply(pd.to_numeric, errors="coerce").fillna(features.median(numeric_only=True))
+    if numeric.shape[0] < 3 or numeric.shape[1] < 1:
+        return pd.DataFrame.from_records(
+            [{"stage": stage, "metadata_column": "", "status": "not_tested_too_few_profiles_or_features"}]
+        )
+    values = numeric.to_numpy(dtype=float)
+    values = values - np.nanmean(values, axis=0)
+    try:
+        _, singular_values, vt = np.linalg.svd(values, full_matrices=False)
+        scores = values @ vt[: min(2, vt.shape[0])].T
+    except np.linalg.LinAlgError:
+        return pd.DataFrame.from_records(
+            [{"stage": stage, "metadata_column": "", "status": "not_tested_svd_failed"}]
+        )
+    records = []
+    for column in valid:
+        labels = metadata[column].astype(str).reset_index(drop=True)
+        for component_index in range(scores.shape[1]):
+            component = scores[:, component_index]
+            grand_mean = float(np.nanmean(component))
+            total_ss = float(np.nansum((component - grand_mean) ** 2))
+            between_ss = 0.0
+            for _, row_index in labels.groupby(labels, dropna=False).groups.items():
+                group_values = component[list(row_index)]
+                between_ss += len(group_values) * (float(np.nanmean(group_values)) - grand_mean) ** 2
+            records.append(
+                {
+                    "stage": stage,
+                    "metadata_column": column,
+                    "component": f"PC{component_index + 1}",
+                    "status": "tested",
+                    "eta_squared": float(between_ss / total_ss) if total_ss > 0 else float("nan"),
+                    "n_groups": int(labels.nunique(dropna=False)),
+                    "n_profiles": int(features.shape[0]),
+                }
+            )
+    return pd.DataFrame.from_records(records)
+
+
+def make_before_after_qc_reports(
+    *,
+    before_features: pd.DataFrame,
+    after_features: pd.DataFrame,
+    metadata: pd.DataFrame,
+    replicate_group_columns: Optional[Sequence[str]] = None,
+    batch_report_columns: Optional[Sequence[str]] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Create before/after replicate and batch-association reports."""
+    rep_pairs = []
+    rep_summaries = []
+    batch_summaries = []
+    for stage, stage_features in [("before_batch_correction", before_features), ("after_batch_correction", after_features)]:
+        pairs, summary = _summarise_stage_replicates(
+            stage=stage,
+            features=stage_features,
+            metadata=metadata,
+            replicate_group_columns=replicate_group_columns,
+        )
+        rep_pairs.append(pairs)
+        rep_summaries.append(summary)
+        batch_summaries.append(
+            _summarise_stage_batch_association(
+                stage=stage,
+                features=stage_features,
+                metadata=metadata,
+                batch_report_columns=batch_report_columns,
+            )
+        )
+    return {
+        "before_after_replicate_correlations": pd.concat(rep_pairs, ignore_index=True),
+        "before_after_replicate_summary": pd.concat(rep_summaries, ignore_index=True),
+        "before_after_batch_pc_association": pd.concat(batch_summaries, ignore_index=True),
+    }
+
+
+
 def scale_features(
     *,
     features: pd.DataFrame,
@@ -784,6 +1197,12 @@ def preprocess_profiles(
     reference_group_columns: Optional[Sequence[str]] = None,
     batch_centering_method: str = "none",
     batch_centering_columns: Optional[Sequence[str]] = None,
+    batch_correction_method: str = "none",
+    batch_column: Optional[str] = None,
+    batch_protect_columns: Optional[Sequence[str]] = None,
+    batch_correction_min_batch_size: int = 3,
+    replicate_group_columns: Optional[Sequence[str]] = None,
+    batch_report_columns: Optional[Sequence[str]] = None,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, pd.DataFrame]:
     """Run a defensive generic Cell Painting preprocessing workflow."""
@@ -921,6 +1340,14 @@ def preprocess_profiles(
     if not winsorisation_report.empty:
         _decision_log(decisions, "winsorisation", "Clipped extreme values to requested quantiles", n_features=int(winsorisation_report.shape[0]))
 
+    reference_control_qc_before_normalisation = calculate_reference_control_qc(
+        features=winsorised,
+        metadata=selected_metadata,
+        reference_column=reference_column,
+        reference_values=reference_values,
+        group_columns=reference_group_columns,
+        method=reference_normalisation_method,
+    )
     normalised_for_imputation, reference_normalisation_report = normalise_features_to_reference(
         features=winsorised,
         metadata=selected_metadata,
@@ -978,7 +1405,33 @@ def preprocess_profiles(
     if batch_centering_method.lower() != "none":
         _decision_log(decisions, "batch_centering", "Applied optional batch centering", method=batch_centering_method)
 
-    scaled_biological = scale_features(features=batch_centered, method=scaling_method, logger=logger)
+    batch_corrected, batch_correction_report, batch_confounding_report = combat_style_location_scale_correction(
+        features=batch_centered,
+        metadata=selected_metadata,
+        batch_column=batch_column,
+        protected_columns=batch_protect_columns,
+        method=batch_correction_method,
+        min_batch_size=batch_correction_min_batch_size,
+        logger=logger,
+    )
+    if batch_correction_method.lower() != "none":
+        _decision_log(
+            decisions,
+            "batch_correction",
+            "Applied optional ComBat-style location/scale batch correction after imputation and before final scaling",
+            method=batch_correction_method,
+            batch_column=str(batch_column),
+        )
+
+    before_after_qc = make_before_after_qc_reports(
+        before_features=batch_centered,
+        after_features=batch_corrected,
+        metadata=selected_metadata,
+        replicate_group_columns=replicate_group_columns,
+        batch_report_columns=batch_report_columns,
+    )
+
+    scaled_biological = scale_features(features=batch_corrected, method=scaling_method, logger=logger)
     _decision_log(decisions, "scaling", "Scaled biological Cell Painting features", method=scaling_method)
 
     if include_missing_indicators_in_correlation_filter:
@@ -1045,6 +1498,12 @@ def preprocess_profiles(
             {"parameter": "reference_column", "value": str(reference_column)},
             {"parameter": "reference_values", "value": ";".join(reference_values or [])},
             {"parameter": "batch_centering_method", "value": batch_centering_method},
+            {"parameter": "batch_correction_method", "value": batch_correction_method},
+            {"parameter": "batch_column", "value": str(batch_column)},
+            {"parameter": "batch_protect_columns", "value": ";".join(batch_protect_columns or [])},
+            {"parameter": "batch_correction_min_batch_size", "value": str(batch_correction_min_batch_size)},
+            {"parameter": "replicate_group_columns", "value": ";".join(replicate_group_columns or [])},
+            {"parameter": "batch_report_columns", "value": ";".join(batch_report_columns or [])},
             {"parameter": "max_features_for_correlation", "value": str(max_features_for_correlation)},
             {"parameter": "include_qc_numeric_features", "value": str(include_qc_numeric_features)},
             {"parameter": "include_missing_indicators_in_correlation_filter", "value": str(include_missing_indicators_in_correlation_filter)},
@@ -1072,6 +1531,8 @@ def preprocess_profiles(
             {"item": "scaling_method", "value": scaling_method},
             {"item": "reference_normalisation_method", "value": reference_normalisation_method},
             {"item": "batch_centering_method", "value": batch_centering_method},
+            {"item": "batch_correction_method", "value": batch_correction_method},
+            {"item": "batch_column", "value": str(batch_column)},
             {"item": "max_feature_missing_fraction", "value": max_feature_missing_fraction},
             {"item": "max_sample_missing_fraction", "value": max_sample_missing_fraction},
             {"item": "max_absolute_correlation", "value": max_absolute_correlation},
@@ -1096,8 +1557,14 @@ def preprocess_profiles(
         "dropped_index_column_report": dropped_index_report,
         "nonfinite_value_report": nonfinite_report,
         "winsorisation_report": winsorisation_report,
+        "reference_control_qc_before_normalisation": reference_control_qc_before_normalisation,
         "reference_normalisation_report": reference_normalisation_report,
         "batch_centering_report": batch_centering_report,
+        "batch_correction_report": batch_correction_report,
+        "batch_confounding_report": batch_confounding_report,
+        "before_after_replicate_correlations": before_after_qc["before_after_replicate_correlations"],
+        "before_after_replicate_summary": before_after_qc["before_after_replicate_summary"],
+        "before_after_batch_pc_association": before_after_qc["before_after_batch_pc_association"],
         "correlation_filter_report": correlation_report,
         "final_matrix_validation": final_matrix_validation,
         "retained_features": retained_features,

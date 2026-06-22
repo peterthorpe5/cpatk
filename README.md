@@ -2,7 +2,7 @@
 
 CPATK is a generic, extensible toolkit for Cell Painting / high-content profiling analysis. It supports defensive preprocessing, QC, classical analysis, optional CLIPn/AI integration, replicate and cluster stability, batch/domain-shift diagnostics, MOA classification, feature attribution and HTML/Excel reporting.
 
-Version: **0.2.11**
+Version: **0.2.12**
 
 ## Design principles
 
@@ -30,7 +30,7 @@ python -m pip install pyarrow plotly umap-learn shap
 
 `pyarrow` enables Parquet output. Without it, CPATK falls back to `.tsv.gz` and logs the reason.
 
-## v0.2.11 release-hardening update
+## v0.2.12 release-hardening update
 
 This release is focused on making CPATK safer for production and publication workflows rather than adding a new analysis method. Key changes are:
 
@@ -68,6 +68,44 @@ cpatk-metadata \
 ```
 
 The main output from this step is `formatted_metadata.tsv`, which should be used as the safer metadata input for later CPATK steps.
+
+
+
+## Recommended workflow at a glance
+
+For a real project, CPATK should normally be run as a staged, auditable workflow rather than as one opaque command:
+
+```text
+raw CellProfiler exports
+  -> cpatk-metadata          # validate and standardise plate-map / annotations
+  -> cpatk-inspect           # inspect CellProfiler files and inferred roles
+  -> cpatk-build-profiles    # merge Image + object compartments into one profile table
+  -> cpatk-preprocess        # QC, all-zero filtering, reference normalisation, imputation, scaling, feature filtering
+  -> cpatk-classical         # PCA/UMAP/distances/neighbours/clustering
+  -> cpatk-stability         # replicate QC, neighbour stability, cluster stability
+  -> cpatk-batch             # plate/batch/domain-shift diagnostics
+  -> cpatk-visualise         # static and interactive plots
+  -> optional cpatk-moa / cpatk-ml / cpatk-explain / cpatk-clipn
+  -> cpatk-report            # final report index
+```
+
+The safest first analysis is deliberately classical: metadata validation, profile building, preprocessing, PCA/UMAP, heatmaps, nearest neighbours, replicate QC and batch diagnostics. CLIPn, MOA classification, ML and SHAP should be added only after these checks look credible.
+
+## Expanded documentation
+
+The following documents give more detailed practical guidance than the README:
+
+```text
+docs/CPATK_USER_GUIDE.md
+docs/CPATK_METHOD_SELECTION_GUIDE.md
+docs/CPATK_METADATA_AND_ANNOTATION_GUIDE.md
+docs/CPATK_MULTI_PLATE_NORMALISATION_AND_BATCH_GUIDE.md
+docs/CPATK_REPLICATE_QC_GUIDE.md
+docs/CPATK_CLIPN_GUIDE.md
+docs/CPATK_NEXT_CODE_PASS_RECOMMENDATIONS.md
+```
+
+The most important production caveat at v0.2.12 is multi-plate CellProfiler export handling. CPATK can analyse multi-plate profile tables once each row has reliable `Metadata_Plate` and `Metadata_Well` values, and `cpatk-preprocess` already supports per-plate DMSO/reference normalisation with `--reference_group_columns Metadata_Plate`. However, if several independent CellProfiler exports are placed in one folder and `ImageNumber` restarts at 1 for each plate/export, v0.2.12 should not be treated as fully native multi-plate folder merging. In that case, build profiles per plate/export first, preserve plate provenance, then combine the resulting profile tables before one joint preprocessing pass. Native composite-key multi-plate folder merging should be the next code pass.
 
 ## Command-line tools
 
@@ -310,10 +348,10 @@ docs/CPATK_v0_2_5_merge_first_preprocessing_audit.md
 
 ## Test status
 
-The v0.2.5 package passed module-level tests:
+The v0.2.12 package passed full unittest discovery in this sandbox with native numerical thread limits set:
 
 ```text
-Ran 91 tests
+Ran 163 tests
 OK
 ```
 
@@ -535,3 +573,16 @@ Metadata_Batch
 Replicate
 Donor / CellLine / Timepoint where relevant
 ```
+
+
+## v0.2.12 multi-plate and batch-correction additions
+
+CPATK now includes safer native support for multi-plate CellProfiler workflows:
+
+- `cpatk-build-profiles --image_merge_keys Metadata_Plate,ImageNumber` for pooled exports where image and object tables share assay plate metadata.
+- `cpatk-combine-profiles` for combining already-reviewed per-plate or per-export profile tables.
+- pre-normalisation DMSO/reference control QC in `cpatk-preprocess`.
+- optional `--batch_correction_method combat_location_scale` with confounding reports.
+- before/after replicate and batch PC-association reports using `--replicate_group_columns` and `--batch_report_columns`.
+
+See `docs/CPATK_v0_2_12_multi_plate_batch_release.md` and `examples/run_cpatk_multi_plate_recommended_workflow.sh`.
