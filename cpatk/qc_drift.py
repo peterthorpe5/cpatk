@@ -14,9 +14,12 @@ from typing import Optional, Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
-
-from cpatk.io import read_table, write_excel_workbook, write_table
+from cpatk.io import (
+    is_ignored_sidecar_path,
+    read_table,
+    write_excel_workbook,
+    write_table,
+)
 from cpatk.plotting import save_current_figure
 from cpatk.reporting import make_html_report
 
@@ -68,6 +71,49 @@ BLOCKED_EXACT = {
 }
 
 
+
+def safe_spearmanr(*, x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    """Return Spearman correlation while avoiding eager SciPy imports.
+
+    Parameters
+    ----------
+    x:
+        First numeric vector.
+    y:
+        Second numeric vector.
+
+    Returns
+    -------
+    tuple[float, float]
+        Spearman rho and p-value. If SciPy cannot be imported, rho is computed
+        from ranked values and the p-value is returned as NaN.
+
+    Notes
+    -----
+    Some HPC environments can have a broken SciPy binary stack even when basic
+    NumPy and pandas work. Drift QC should still be importable so that CPATK can
+    report the environment problem at the point where a SciPy p-value is needed.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 3:
+        return np.nan, np.nan
+    x = x[mask]
+    y = y[mask]
+    try:
+        from scipy.stats import spearmanr  # type: ignore
+
+        rho, p_value = spearmanr(x, y)
+        return float(rho), float(p_value)
+    except Exception:
+        x_rank = pd.Series(x).rank(method="average").to_numpy(dtype=float)
+        y_rank = pd.Series(y).rank(method="average").to_numpy(dtype=float)
+        if np.nanstd(x_rank) == 0.0 or np.nanstd(y_rank) == 0.0:
+            return np.nan, np.nan
+        rho = np.corrcoef(x_rank, y_rank)[0, 1]
+        return float(rho), np.nan
+
 def infer_compartment_from_name(*, filename: str) -> Optional[str]:
     """Infer compartment name from a CellProfiler output filename."""
     lower = filename.lower()
@@ -97,6 +143,8 @@ def list_compartment_files(
     mapping: dict[str, list[Path]] = {}
     for pattern in patterns:
         for path in sorted(input_dir.rglob(pattern)):
+            if is_ignored_sidecar_path(path=path):
+                continue
             compartment = infer_compartment_from_name(filename=path.name)
             if compartment is None or compartment == "Image":
                 continue
@@ -228,7 +276,7 @@ def compute_drift_statistics(
             p_value = np.nan
             slope = np.nan
         else:
-            rho, p_value = spearmanr(x_img, y_img)
+            rho, p_value = safe_spearmanr(x=x_img, y=y_img)
             x0 = x_img - np.nanmedian(x_img)
             try:
                 slope = float(np.polyfit(x0, y_img, deg=1)[0])

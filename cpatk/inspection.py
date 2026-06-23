@@ -73,8 +73,26 @@ def inspect_directory(
     inventory = list_supported_tables(input_dir=input_dir)
     summaries = []
     columns = []
+    failures = []
     for path_string in inventory.get("path", []):
-        result = inspect_table_file(path=path_string, logger=logger)
+        try:
+            result = inspect_table_file(path=path_string, logger=logger)
+        except Exception as error:
+            if logger is not None:
+                logger.warning(
+                    "Skipping unreadable table during inspection: %s (%s)",
+                    path_string,
+                    error,
+                )
+            failures.append(
+                {
+                    "path": path_string,
+                    "file_name": Path(path_string).name,
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                }
+            )
+            continue
         summary = result["summary"].copy()
         summaries.append(summary)
         column_inventory = result["column_inventory"].copy()
@@ -90,4 +108,5 @@ def inspect_directory(
         "file_inventory": inventory,
         "file_summary": summary_table,
         "column_inventory": column_table,
+        "inspection_failure_report": pd.DataFrame.from_records(failures),
     }

@@ -2,7 +2,7 @@
 
 CPATK is a generic, extensible toolkit for Cell Painting / high-content profiling analysis. It supports defensive preprocessing, QC, classical analysis, optional CLIPn/AI integration, replicate and cluster stability, batch/domain-shift diagnostics, MOA classification, feature attribution and HTML/Excel reporting.
 
-Version: **0.2.14**
+Version: **0.2.15**
 
 ## Design principles
 
@@ -30,7 +30,7 @@ python -m pip install pyarrow plotly umap-learn shap
 
 `pyarrow` enables Parquet output. Without it, CPATK falls back to `.tsv.gz` and logs the reason.
 
-## v0.2.14 release-hardening update
+## v0.2.15 release-hardening update
 
 This release is focused on making CPATK safer for production and publication workflows rather than adding a new analysis method. Key changes are:
 
@@ -106,7 +106,7 @@ docs/CPATK_PHENOTYPE_LABELLED_MOA_GUIDE.md
 docs/CPATK_NEXT_CODE_PASS_RECOMMENDATIONS.md
 ```
 
-The most important production caveat at v0.2.14 is multi-plate CellProfiler export handling. CPATK can analyse multi-plate profile tables once each row has reliable `Metadata_Plate` and `Metadata_Well` values, and `cpatk-preprocess` already supports per-plate DMSO/reference normalisation with `--reference_group_columns Metadata_Plate`. However, if several independent CellProfiler exports are placed in one folder and `ImageNumber` restarts at 1 for each plate/export, v0.2.14 should not be treated as fully native multi-plate folder merging. In that case, build profiles per plate/export first, preserve plate provenance, then combine the resulting profile tables before one joint preprocessing pass. Native composite-key multi-plate folder merging should be the next code pass.
+The most important production caveat at v0.2.15 is multi-plate CellProfiler export handling. CPATK can analyse multi-plate profile tables once each row has reliable `Metadata_Plate` and `Metadata_Well` values, and `cpatk-preprocess` already supports per-plate DMSO/reference normalisation with `--reference_group_columns Metadata_Plate`. However, if several independent CellProfiler exports are placed in one folder and `ImageNumber` restarts at 1 for each plate/export, v0.2.15 should not be treated as fully native multi-plate folder merging. In that case, build profiles per plate/export first, preserve plate provenance, then combine the resulting profile tables before one joint preprocessing pass. Native composite-key multi-plate folder merging should be the next code pass.
 
 ## Command-line tools
 
@@ -363,7 +363,7 @@ docs/CPATK_v0_2_5_merge_first_preprocessing_audit.md
 
 ## Test status
 
-The v0.2.14 package passed full unittest discovery in this sandbox with native numerical thread limits set:
+The v0.2.15 package passed full unittest discovery in this sandbox with native numerical thread limits set:
 
 ```text
 Ran 163 tests
@@ -590,7 +590,7 @@ Donor / CellLine / Timepoint where relevant
 ```
 
 
-## v0.2.14 multi-plate and batch-correction additions
+## v0.2.15 multi-plate and batch-correction additions
 
 CPATK now includes safer native support for multi-plate CellProfiler workflows:
 
@@ -601,3 +601,16 @@ CPATK now includes safer native support for multi-plate CellProfiler workflows:
 - before/after replicate and batch PC-association reports using `--replicate_group_columns` and `--batch_report_columns`.
 
 See `docs/CPATK_v0_2_12_multi_plate_batch_release.md` and `examples/run_cpatk_multi_plate_recommended_workflow.sh`.
+
+## v0.2.15 note: macOS sidecar files and cluster SciPy imports
+
+CPATK v0.2.15 skips macOS AppleDouble sidecar files such as `._table.tsv`
+during table discovery. These files are not real data tables and can contain
+binary metadata bytes that break UTF-8 decoding. The inspection workflow also
+writes `inspection_failure_report.tsv` for any recognised table that cannot be
+read cleanly.
+
+The acquisition-drift module now imports SciPy lazily for Spearman p-values and
+falls back to a NumPy/pandas Spearman rho if `scipy.stats` cannot be imported in
+a problematic HPC environment. Full drift QC, ML and PCA/UMAP workflows still
+need a working SciPy/scikit-learn stack for production analysis.

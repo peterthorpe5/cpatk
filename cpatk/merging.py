@@ -31,7 +31,12 @@ from cpatk.features import (
     make_column_inventory,
     parse_column_list,
 )
-from cpatk.io import read_table, write_excel_workbook, write_table
+from cpatk.io import (
+    is_ignored_sidecar_path,
+    read_table,
+    write_excel_workbook,
+    write_table,
+)
 from cpatk.metadata import (
     drop_unnamed_index_columns,
     normalise_column_names,
@@ -111,7 +116,11 @@ def discover_table_files(*, input_dir: Path | str, recursive: bool = False) -> p
     pattern = "**/*" if recursive else "*"
     records: List[Dict[str, object]] = []
     for path in sorted(input_dir.glob(pattern)):
-        if not path.is_file() or not _has_supported_suffix(path):
+        if (
+            not path.is_file()
+            or is_ignored_sidecar_path(path=path)
+            or not _has_supported_suffix(path)
+        ):
             continue
         records.append(
             {

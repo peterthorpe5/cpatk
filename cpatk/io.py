@@ -18,6 +18,34 @@ from openpyxl.styles import Font, PatternFill, Alignment
 TableLike = Union[pd.DataFrame, Mapping[str, pd.DataFrame]]
 
 
+def is_ignored_sidecar_path(*, path: Union[str, Path]) -> bool:
+    """Return whether a path should be ignored during table discovery.
+
+    Parameters
+    ----------
+    path:
+        Candidate path to evaluate.
+
+    Returns
+    -------
+    bool
+        True when the file or any parent component is a hidden/system sidecar.
+
+    Notes
+    -----
+    macOS AppleDouble files such as ``._table.tsv`` can be created when data
+    are copied from a Mac. They are not real tables and often contain binary
+    metadata bytes, so CPATK must ignore them during folder discovery.
+    """
+    candidate = Path(path)
+    for part in candidate.parts:
+        if part in {".", ".."}:
+            continue
+        if part.startswith("._") or part.startswith(".") or part.startswith("~$"):
+            return True
+    return False
+
+
 def read_table(
     *,
     path: Union[str, Path],
@@ -48,9 +76,9 @@ def read_table(
     if suffixes.endswith(".parquet"):
         return pd.read_parquet(path=path)
     if suffixes.endswith(".tsv") or suffixes.endswith(".tsv.gz"):
-        return pd.read_csv(filepath_or_buffer=path, sep="\t")
+        return pd.read_csv(filepath_or_buffer=path, sep="\t", encoding="utf-8-sig", encoding_errors="replace")
     if suffixes.endswith(".csv") or suffixes.endswith(".csv.gz"):
-        return pd.read_csv(filepath_or_buffer=path, encoding="utf-8-sig", low_memory=False)
+        return pd.read_csv(filepath_or_buffer=path, encoding="utf-8-sig", encoding_errors="replace", low_memory=False)
     if suffixes.endswith(".xlsx") or suffixes.endswith(".xls"):
         return pd.read_excel(io=path, sheet_name=sheet_name or 0)
 
@@ -242,6 +270,8 @@ def list_supported_tables(*, input_dir: Union[str, Path]) -> pd.DataFrame:
     records = []
     for pattern in patterns:
         for path in sorted(input_dir.glob(pattern)):
+            if is_ignored_sidecar_path(path=path):
+                continue
             records.append(
                 {
                     "path": str(path),
