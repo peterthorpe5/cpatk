@@ -15,18 +15,74 @@ Version: **0.2.15**
 
 ## Installation
 
+For a lightweight CPATK-only development install:
+
 ```bash
-cd cpatk_v0_2_11_full
+cd cpatk_v0_2_15_full
 python -m pip install -e .
+
 env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
-  python -m unittest discover -s tests -v
+  python -m unittest discover -s tests -q
 ```
 
-Optional dependencies:
+For the full CPATK + CLIPn + AI/ML environment on the cluster, use the confirmed Python 3.10 environment recipe in:
+
+```text
+docs/CPATK_CONFIRMED_CLUSTER_INSTALLATION_GUIDE.md
+examples/create_cpatk_confirmed_cluster_env.sh
+```
+
+The confirmed cluster environment was named `cpatk` and passed the full CPATK unit-test suite:
+
+```text
+Ran 179 tests in 19.218s
+OK
+```
+
+The key pinned choices are:
+
+```text
+python=3.10
+numpy=1.26.4
+pandas=2.0
+scipy=1.13.1
+scikit-learn=1.6.1
+umap-learn=0.5.8
+pytorch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
+pytorch-cuda=11.8
+```
+
+The full environment should be built with conda-forge/mamba for compiled scientific packages, then pip only for the packages that are not cleanly available through conda. Use `--no-deps` for these pip packages so pip does not overwrite the conda-built numerical stack:
 
 ```bash
-python -m pip install pyarrow plotly umap-learn shap
+python -m pip install --no-deps kmapper
+python -m pip install --no-deps clipn
+python -m pip install --no-deps copairs
+python -m pip install --no-deps onnx==1.14.1 onnxruntime==1.16.3
 ```
+
+The following additional packages must also be present; install these via conda-forge/mamba, not pip:
+
+```text
+duckdb
+statsmodels
+protobuf
+coloredlogs
+flatbuffers
+fsspec
+tqdm
+```
+
+After activating the environment in an SGE job, use:
+
+```bash
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+export LD_PRELOAD="${CONDA_PREFIX}/lib/libstdc++.so.6${LD_PRELOAD:+:${LD_PRELOAD}}"
+```
+
+This avoids common cluster failures where SciPy or scikit-learn accidentally load the system `libstdc++` rather than the conda environment copy.
 
 `pyarrow` enables Parquet output. Without it, CPATK falls back to `.tsv.gz` and logs the reason.
 
@@ -96,6 +152,7 @@ The safest first analysis is deliberately classical: metadata validation, profil
 The following documents give more detailed practical guidance than the README:
 
 ```text
+docs/CPATK_CONFIRMED_CLUSTER_INSTALLATION_GUIDE.md
 docs/CPATK_USER_GUIDE.md
 docs/CPATK_METHOD_SELECTION_GUIDE.md
 docs/CPATK_METADATA_AND_ANNOTATION_GUIDE.md
