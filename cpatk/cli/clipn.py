@@ -120,10 +120,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--drop_rows_with_any_zero",
         action="store_true",
         help=(
-            "Strict CLIPn option: drop any row containing at least one literal zero after "
-            "missingness filtering. This is usually too aggressive; all-zero rows/features "
-            "are removed by default."
+            "Strict legacy/debug option: drop any row containing at least one literal zero "
+            "after imputation/scaling. This is usually too aggressive for Cell Painting; "
+            "CLIPn can accept literal zeros, so the default is to keep them."
         ),
+    )
+    parser.add_argument(
+        "--clipn_zero_policy",
+        choices=["drop_rows", "keep", "error"],
+        default="keep",
+        help=(
+            "How to handle literal zeros after imputation/scaling before CLIPn. "
+            "keep leaves real zeros untouched and records an audit; this is the default. "
+            "drop_rows/error are mainly for legacy/debugging checks."
+        ),
+    )
+    parser.add_argument(
+        "--clipn_zero_epsilon",
+        type=float,
+        default=1e-8,
+        help="Deprecated compatibility argument retained for old scripts; CPATK does not epsilon-replace zeros.",
     )
     parser.add_argument(
         "--keep_all_zero_rows",
@@ -227,6 +243,8 @@ def main() -> None:
         remove_all_zero_rows=not args.keep_all_zero_rows,
         remove_all_zero_features=not args.keep_all_zero_features,
         drop_rows_with_any_zero=args.drop_rows_with_any_zero,
+        zero_policy=args.clipn_zero_policy,
+        zero_epsilon=args.clipn_zero_epsilon,
         allow_pca_fallback=args.allow_pca_fallback,
     )
     run_clipn_workflow(

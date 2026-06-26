@@ -947,29 +947,55 @@ def run_visualisation_workflow(
                 logger.warning("PHATE output skipped: %s", exc)
 
     if make_heatmap:
-        ordered, row_order, col_order, _ = draw_clustered_heatmap(
+        plain, plain_row_order, plain_col_order, _ = draw_clustered_heatmap(
             matrix=features,
             output_path_base=plots_dir / "profile_feature_heatmap",
             title="Profile feature heatmap",
+            cluster_rows=False,
+            cluster_columns=False,
+            max_rows=120,
+            logger=logger,
+        )
+        ordered, row_order, col_order, _ = draw_clustered_heatmap(
+            matrix=features,
+            output_path_base=plots_dir / "profile_feature_heatmap_clustered",
+            title="Profile feature heatmap, hierarchically clustered",
+            cluster_rows=True,
+            cluster_columns=True,
             max_rows=120,
             logger=logger,
         )
         outputs["heatmap_matrix"] = write_table(
-            data_frame=ordered.reset_index(names="profile_id"),
+            data_frame=plain.reset_index(names="profile_id"),
             path=output_dir / "heatmap_matrix.tsv",
             logger=logger,
         )
         outputs["heatmap_row_order"] = write_table(
-            data_frame=row_order,
+            data_frame=plain_row_order,
             path=output_dir / "heatmap_row_order.tsv",
             logger=logger,
         )
         outputs["heatmap_column_order"] = write_table(
-            data_frame=col_order,
+            data_frame=plain_col_order,
             path=output_dir / "heatmap_column_order.tsv",
             logger=logger,
         )
-        heatmap_plots = sorted(plots_dir.glob("profile_feature_heatmap.*"))
+        outputs["clustered_heatmap_matrix"] = write_table(
+            data_frame=ordered.reset_index(names="profile_id"),
+            path=output_dir / "clustered_heatmap_matrix.tsv",
+            logger=logger,
+        )
+        outputs["clustered_heatmap_row_order"] = write_table(
+            data_frame=row_order,
+            path=output_dir / "clustered_heatmap_row_order.tsv",
+            logger=logger,
+        )
+        outputs["clustered_heatmap_column_order"] = write_table(
+            data_frame=col_order,
+            path=output_dir / "clustered_heatmap_column_order.tsv",
+            logger=logger,
+        )
+        heatmap_plots = sorted(plots_dir.glob("profile_feature_heatmap*.*"))
         for index, path in enumerate(heatmap_plots, start=1):
             outputs[f"profile_feature_heatmap_{index}"] = path
 

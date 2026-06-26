@@ -183,6 +183,8 @@ class ClipnAdapterConfig:
     remove_all_zero_rows: bool = True
     remove_all_zero_features: bool = True
     drop_rows_with_any_zero: bool = False
+    zero_policy: str = "keep"
+    zero_epsilon: float = 1e-8  # Deprecated compatibility field; zeros are not replaced.
     allow_pca_fallback: bool = False
 
 
@@ -414,12 +416,12 @@ def remove_zero_only_clipn_profiles(
     feature_cols: Sequence[str],
     config: ClipnAdapterConfig,
 ) -> tuple[pd.DataFrame, list[str], int, int]:
-    """Remove zero-only rows/features before CLIPn modelling.
+    """Remove all-zero rows/features before CLIPn imputation.
 
-    Literal zero values can be introduced by valid preprocessing and scaling, so
-    the default policy removes only all-zero feature columns and all-zero rows.
-    The optional ``drop_rows_with_any_zero`` mode is deliberately off by default
-    because it can be very destructive for scaled Cell Painting profiles.
+    These filters remove profiles or features that contain no signal at all.
+    This is an empty-signal QC step, not a CLIPn requirement to remove
+    literal zeros. Real zero values are audited later by
+    ``apply_clipn_zero_policy`` and are kept by default.
     """
     output = table.copy()
     features = list(feature_cols)
@@ -435,10 +437,6 @@ def remove_zero_only_clipn_profiles(
         zero_row_mask = output[features].fillna(0.0).eq(0.0).all(axis=1)
         rows_dropped_all_zero = int(zero_row_mask.sum())
         output = output.loc[~zero_row_mask].copy()
-    if features and config.drop_rows_with_any_zero:
-        any_zero_mask = output[features].eq(0.0).any(axis=1)
-        rows_dropped_any_zero = int(any_zero_mask.sum())
-        output = output.loc[~any_zero_mask].copy()
     return (
         output,
         [feature for feature in features if feature in output.columns],
@@ -446,6 +444,84 @@ def remove_zero_only_clipn_profiles(
         rows_dropped_all_zero,
         rows_dropped_any_zero,
     )
+
+
+def apply_clipn_zero_policy(
+    *,
+    table: pd.DataFrame,
+    feature_cols: Sequence[str],
+    config: ClipnAdapterConfig,
+    logger: Optional[logging.Logger] = None,
+) -> tuple[pd.DataFrame, list[str], pd.DataFrame]:
+    """Apply the final CLIPn literal-zero policy after imputation/scaling.
+
+    CLIPn can accept literal zeros, but it cannot accept missing, NaN or
+    non-finite values.  This function therefore audits zeros after
+    imputation/scaling but leaves them unchanged by default.  Strict row
+    dropping and error-on-zero modes remain available for legacy/debugging
+    checks, but they are not recommended for general Cell Painting matrices.
+    """
+    output = table.copy()
+    features = [feature for feature in feature_cols if feature in output.columns]
+    policy = "drop_rows" if config.drop_rows_with_any_zero else str(config.zero_policy).lower()
+    if policy not in {"drop_rows", "keep", "error"}:
+        raise ValueError(f"Unsupported CLIPn zero_policy: {config.zero_policy}")
+    if not features:
+        report = pd.DataFrame.from_records(
+            [{"item": "zero_policy", "value": policy}, {"item": "n_features_checked", "value": 0}]
+        )
+        return output, features, report
+
+    zero_mask = output[features].eq(0.0)
+    rows_with_zero_mask = zero_mask.any(axis=1)
+    features_with_zero_mask = zero_mask.any(axis=0)
+    zeros_before = int(zero_mask.sum().sum())
+    rows_with_zero_before = int(rows_with_zero_mask.sum())
+    features_with_zero_before = int(features_with_zero_mask.sum())
+    rows_dropped = 0
+    zeros_replaced = 0
+
+    if zeros_before and policy == "error":
+        raise ValueError(
+            "CLIPn input contains literal zero values after imputation/scaling. "
+            "CLIPn can usually accept zeros, so use --clipn_zero_policy keep unless "
+            "you are deliberately auditing zero sensitivity."
+        )
+    if zeros_before and policy == "drop_rows":
+        rows_dropped = rows_with_zero_before
+        output = output.loc[~rows_with_zero_mask].copy()
+        if output.empty:
+            raise ValueError(
+                "Strict CLIPn zero filtering removed every sample. "
+                "CLIPn can accept literal zeros; rerun with --clipn_zero_policy keep "
+                "and without --drop_rows_with_any_zero unless this strict behaviour "
+                "was intentional."
+            )
+
+    zeros_after = int(output[features].eq(0.0).sum().sum()) if features else 0
+    if logger is not None:
+        logger.info(
+            "CLIPn zero policy applied: policy=%s, zeros_before=%s, "
+            "zeros_replaced=%s, rows_dropped=%s, zeros_after=%s",
+            policy,
+            zeros_before,
+            zeros_replaced,
+            rows_dropped,
+            zeros_after,
+        )
+    report = pd.DataFrame.from_records(
+        [
+            {"item": "zero_policy", "value": policy},
+            {"item": "n_features_checked", "value": int(len(features))},
+            {"item": "literal_zero_values_before_policy", "value": zeros_before},
+            {"item": "rows_with_literal_zero_before_policy", "value": rows_with_zero_before},
+            {"item": "features_with_literal_zero_before_policy", "value": features_with_zero_before},
+            {"item": "rows_dropped_by_zero_policy", "value": rows_dropped},
+            {"item": "literal_zero_values_changed_by_policy", "value": zeros_replaced},
+            {"item": "literal_zero_values_after_policy", "value": zeros_after},
+        ]
+    )
+    return output, features, report
 
 
 def read_datasets_manifest(*, path: Path | str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
@@ -579,7 +655,7 @@ def clean_impute_and_scale_aligned(
     config: ClipnAdapterConfig,
     logger: Optional[logging.Logger] = None,
 ) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
-    """Clean non-finite values, remove sparse rows/features, impute and scale."""
+    """Clean non-finite values, impute/scale and prepare CLIPn-safe matrices."""
     combined = []
     for name, features in aligned.items():
         block = features.copy()
@@ -665,6 +741,16 @@ def clean_impute_and_scale_aligned(
         scaler_cls = RobustScaler if config.scaling_method == "robust" else StandardScaler
         scaler = scaler_cls()
         table.loc[:, feature_cols] = scaler.fit_transform(table[feature_cols])
+
+    table, feature_cols, zero_policy_report = apply_clipn_zero_policy(
+        table=table,
+        feature_cols=feature_cols,
+        config=config,
+        logger=logger,
+    )
+    if table.empty:
+        raise ValueError("No CLIPn samples remained after final zero-policy handling.")
+
     cleaned: dict[str, pd.DataFrame] = {}
     for name in aligned:
         block = table.loc[table["Dataset"] == name, ["Sample", *feature_cols]].copy()
@@ -681,7 +767,7 @@ def clean_impute_and_scale_aligned(
             {"item": "zero_only_features_dropped", "value": int(len(zero_only_dropped_features))},
             {"item": "rows_dropped_for_missingness", "value": dropped_rows},
             {"item": "all_zero_rows_dropped", "value": rows_dropped_all_zero},
-            {"item": "rows_with_any_zero_dropped", "value": rows_dropped_any_zero},
+            {"item": "rows_with_any_zero_dropped_pre_imputation", "value": rows_dropped_any_zero},
             {"item": "extreme_values_converted_to_missing", "value": n_extreme},
             {"item": "missing_values_before_imputation", "value": n_missing_before},
             {"item": "missing_values_after_imputation", "value": n_missing_after},
@@ -689,6 +775,7 @@ def clean_impute_and_scale_aligned(
             {"item": "scaling_method", "value": config.scaling_method},
         ]
     )
+    summary = pd.concat([summary, zero_policy_report], ignore_index=True, sort=False)
     if logger is not None:
         logger.info("CLIPn preprocessing summary: %s", summary.to_dict(orient="records"))
     return cleaned, summary
@@ -1204,7 +1291,7 @@ def run_clipn_workflow(
         narrative=(
             "This report summarises the optional CLIPn workflow. The adapter first harmonises "
             "features across datasets, cleans non-finite values, handles missing data, scales "
-            "features, removes zero-only rows/features for CLIPn compatibility, and then runs a compatible CLIPn backend when available. If the backend "
+            "features, removes only empty all-zero rows/features as QC, audits literal zeros without changing them, and then runs a compatible CLIPn backend when available. If the backend "
             "is unavailable, the report records the reason and preserves all preprocessing audits."
         ),
         warnings=warnings,

@@ -33,7 +33,9 @@ def configure_logging(
     """
     logger = logging.getLogger(name=logger_name)
     logger.setLevel(level=getattr(logging, log_level.upper(), logging.INFO))
-    logger.handlers.clear()
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
     logger.propagate = False
 
     formatter = logging.Formatter(

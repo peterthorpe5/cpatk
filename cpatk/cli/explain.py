@@ -18,6 +18,7 @@ from cpatk.logging_utils import configure_logging
 from cpatk.neighbourhood_explain import (
     calculate_neighbourhood_shap,
     calculate_query_background_statistics,
+    clean_numeric_feature_matrix,
     group_importance_by_feature_family,
     make_binary_neighbourhood_dataset,
     parse_query_ids,
@@ -53,6 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nn_file", default=None, help="Nearest-neighbour table with cpd_id/query_id and neighbour_id columns.")
     parser.add_argument("--n_neighbours", type=int, default=5)
     parser.add_argument("--run_neighbourhood_shap", action="store_true")
+    parser.add_argument(
+        "--run_query_background_shap",
+        action="store_true",
+        help=(
+            "Run a local SHAP-style binary explanation for each query ID versus "
+            "the configured background/control values, for example compound vs DMSO."
+        ),
+    )
     parser.add_argument("--run_feature_tests", action="store_true")
     parser.add_argument("--background_column", default="cpd_type")
     parser.add_argument("--background_values", default="DMSO,control,negative_control")
@@ -156,6 +165,8 @@ def _run_query_neighbourhoods(
         query_dir.mkdir(parents=True, exist_ok=True)
         logger.info("Running query-level explanation for %s", query_id)
         neighbours: list[str] = []
+        query_report_tables: dict[str, pd.DataFrame] = {}
+        query_report_plots: list[Path] = []
         if neighbour_table is not None:
             neighbours = select_neighbour_ids(
                 neighbour_table=neighbour_table,
@@ -190,14 +201,15 @@ def _run_query_neighbourhoods(
                 write_table(data_frame=top_increased, path=query_dir / "top_query_increased_features.tsv", logger=logger)
                 write_table(data_frame=top_decreased, path=query_dir / "top_query_decreased_features.tsv", logger=logger)
                 all_tables[f"{query_id}_feature_stats"] = stats.head(200)
-                all_plots.extend(
-                    plot_signed_feature_statistics(
-                        stats_table=stats,
-                        output_path_base=query_dir / "query_vs_background_signed_feature_shifts",
-                        top_n=args.n_top_features,
-                        logger=logger,
-                    )
+                query_report_tables["Query vs background feature statistics"] = stats.head(200)
+                feature_stat_plots = plot_signed_feature_statistics(
+                    stats_table=stats,
+                    output_path_base=query_dir / "query_vs_background_signed_feature_shifts",
+                    top_n=args.n_top_features,
+                    logger=logger,
                 )
+                all_plots.extend(feature_stat_plots)
+                query_report_plots.extend(feature_stat_plots)
             except Exception as exc:
                 logger.warning("Feature tests failed for %s: %s", query_id, exc)
                 write_table(
@@ -205,25 +217,38 @@ def _run_query_neighbourhoods(
                     path=query_dir / "query_vs_background_feature_statistics_status.tsv",
                     logger=logger,
                 )
-        if args.run_neighbourhood_shap:
-            if not neighbours:
-                logger.warning("Skipping neighbourhood SHAP for %s because no neighbours were selected.", query_id)
-                continue
+        if args.run_query_background_shap:
             try:
-                x, y, subset_metadata, column_audit = make_binary_neighbourhood_dataset(
-                    metadata=metadata,
-                    features=features,
-                    id_column=args.id_column,
-                    query_id=query_id,
-                    neighbour_ids=neighbours,
-                    feature_columns=feature_columns,
+                ids = metadata[args.id_column].map(lambda value: str(value).strip().lower())
+                query_key = str(query_id).strip().lower()
+                query_mask = ids == query_key
+                accepted_background = {str(value).strip().lower() for value in background_values}
+                if args.background_column in metadata.columns:
+                    background_mask = metadata[args.background_column].map(
+                        lambda value: str(value).strip().lower()
+                    ).isin(accepted_background)
+                else:
+                    background_mask = ~query_mask
+                combined_mask = (query_mask | background_mask).to_numpy()
+                if int(query_mask.sum()) == 0:
+                    raise ValueError(f"No profiles found for query_id: {query_id}")
+                if int(background_mask.sum()) == 0:
+                    raise ValueError("No background/control profiles available for SHAP comparison.")
+                subset_features = features.loc[combined_mask, :].reset_index(drop=True)
+                subset_metadata = metadata.loc[combined_mask, :].reset_index(drop=True)
+                clean_x, column_audit = clean_numeric_feature_matrix(
+                    features=subset_features,
+                    explicit_feature_columns=feature_columns,
                 )
-                write_table(data_frame=subset_metadata, path=query_dir / "query_neighbourhood_metadata.tsv", logger=logger)
-                write_table(data_frame=column_audit, path=query_dir / "query_neighbourhood_column_audit.tsv", logger=logger)
+                y = subset_metadata[args.id_column].map(lambda value: str(value).strip().lower()).eq(query_key).astype(int)
+                if y.nunique() < 2:
+                    raise ValueError("Query-background SHAP requires both query and background profiles.")
+                write_table(data_frame=subset_metadata, path=query_dir / "query_vs_background_metadata.tsv", logger=logger)
+                write_table(data_frame=column_audit, path=query_dir / "query_vs_background_column_audit.tsv", logger=logger)
                 shap_result = calculate_neighbourhood_shap(
-                    x=x,
+                    x=clean_x,
                     y=y,
-                    query_id=query_id,
+                    query_id=f"{query_id}_vs_background",
                     n_top_features=args.n_top_features,
                     max_background=args.max_shap_background,
                     max_explain=args.max_shap_explain,
@@ -234,16 +259,87 @@ def _run_query_neighbourhoods(
                 low_features = shap_result["low_contribution_features"]  # type: ignore[index]
                 shap_values = shap_result["sample_feature_shap_values"]  # type: ignore[index]
                 shap_status = shap_result["status"]  # type: ignore[index]
-                write_table(data_frame=top_features, path=query_dir / "top_shap_features_driving_query_difference.tsv", logger=logger)
-                write_table(data_frame=low_features, path=query_dir / "low_contribution_shap_features.tsv", logger=logger)
-                write_table(data_frame=shap_values, path=query_dir / "sample_feature_shap_values.tsv.gz", logger=logger)
-                write_table(data_frame=shap_status, path=query_dir / "neighbourhood_shap_status.tsv", logger=logger)
+                write_table(data_frame=top_features, path=query_dir / "query_vs_background_top_shap_features.tsv", logger=logger)
+                write_table(data_frame=low_features, path=query_dir / "query_vs_background_low_contribution_shap_features.tsv", logger=logger)
+                write_table(data_frame=shap_values, path=query_dir / "query_vs_background_sample_feature_shap_values.tsv.gz", logger=logger)
+                write_table(data_frame=shap_status, path=query_dir / "query_vs_background_shap_status.tsv", logger=logger)
                 family = group_importance_by_feature_family(importance_table=top_features, value_column="mean_absolute_shap")
-                write_table(data_frame=family, path=query_dir / "top_shap_feature_family_summary.tsv", logger=logger)
-                all_tables[f"{query_id}_shap_top_features"] = top_features
-                all_tables[f"{query_id}_shap_status"] = shap_status
-                all_plots.extend(
-                    plot_shap_outputs(
+                write_table(data_frame=family, path=query_dir / "query_vs_background_shap_feature_family_summary.tsv", logger=logger)
+                all_tables[f"{query_id}_vs_background_shap_top_features"] = top_features
+                all_tables[f"{query_id}_vs_background_shap_status"] = shap_status
+                query_report_tables["Query vs background SHAP top features"] = top_features
+                query_report_tables["Query vs background SHAP status"] = shap_status
+                query_report_tables["Query vs background SHAP feature-family summary"] = family
+                background_plots = plot_shap_outputs(
+                    shap_array=shap_result["shap_array"],  # type: ignore[arg-type,index]
+                    explained_x=shap_result["explained_x"],  # type: ignore[arg-type,index]
+                    top_features=top_features,
+                    output_path_base=query_dir / "query_vs_background_shap",
+                    max_display=args.n_top_features,
+                    n_dependence=args.n_dependence_plots,
+                    logger=logger,
+                )
+                all_plots.extend(background_plots)
+                query_report_plots.extend(background_plots)
+                write_excel_workbook(
+                    tables={
+                        "top_shap_features": top_features,
+                        "low_contribution_features": low_features,
+                        "shap_status": shap_status,
+                        "feature_family_summary": family,
+                    },
+                    path=query_dir / "query_vs_background_shap_summary.xlsx",
+                    logger=logger,
+                )
+            except Exception as exc:
+                logger.warning("Query-vs-background SHAP failed for %s: %s", query_id, exc)
+                status = pd.DataFrame.from_records(
+                    [{"query_id": query_id, "status": "failed", "message": str(exc)}]
+                )
+                write_table(data_frame=status, path=query_dir / "query_vs_background_shap_status.tsv", logger=logger)
+                query_report_tables["Query vs background SHAP status"] = status
+
+        if args.run_neighbourhood_shap:
+            if not neighbours:
+                logger.warning("Skipping neighbourhood SHAP for %s because no neighbours were selected.", query_id)
+            else:
+                try:
+                    x, y, subset_metadata, column_audit = make_binary_neighbourhood_dataset(
+                        metadata=metadata,
+                        features=features,
+                        id_column=args.id_column,
+                        query_id=query_id,
+                        neighbour_ids=neighbours,
+                        feature_columns=feature_columns,
+                    )
+                    write_table(data_frame=subset_metadata, path=query_dir / "query_neighbourhood_metadata.tsv", logger=logger)
+                    write_table(data_frame=column_audit, path=query_dir / "query_neighbourhood_column_audit.tsv", logger=logger)
+                    shap_result = calculate_neighbourhood_shap(
+                        x=x,
+                        y=y,
+                        query_id=query_id,
+                        n_top_features=args.n_top_features,
+                        max_background=args.max_shap_background,
+                        max_explain=args.max_shap_explain,
+                        n_jobs=1,
+                        logger=logger,
+                    )
+                    top_features = shap_result["top_features"]  # type: ignore[index]
+                    low_features = shap_result["low_contribution_features"]  # type: ignore[index]
+                    shap_values = shap_result["sample_feature_shap_values"]  # type: ignore[index]
+                    shap_status = shap_result["status"]  # type: ignore[index]
+                    write_table(data_frame=top_features, path=query_dir / "top_shap_features_driving_query_difference.tsv", logger=logger)
+                    write_table(data_frame=low_features, path=query_dir / "low_contribution_shap_features.tsv", logger=logger)
+                    write_table(data_frame=shap_values, path=query_dir / "sample_feature_shap_values.tsv.gz", logger=logger)
+                    write_table(data_frame=shap_status, path=query_dir / "neighbourhood_shap_status.tsv", logger=logger)
+                    family = group_importance_by_feature_family(importance_table=top_features, value_column="mean_absolute_shap")
+                    write_table(data_frame=family, path=query_dir / "top_shap_feature_family_summary.tsv", logger=logger)
+                    all_tables[f"{query_id}_shap_top_features"] = top_features
+                    all_tables[f"{query_id}_shap_status"] = shap_status
+                    query_report_tables["Neighbourhood SHAP top features"] = top_features
+                    query_report_tables["Neighbourhood SHAP status"] = shap_status
+                    query_report_tables["Neighbourhood SHAP feature-family summary"] = family
+                    neighbourhood_plots = plot_shap_outputs(
                         shap_array=shap_result["shap_array"],  # type: ignore[arg-type,index]
                         explained_x=shap_result["explained_x"],  # type: ignore[arg-type,index]
                         top_features=top_features,
@@ -252,31 +348,58 @@ def _run_query_neighbourhoods(
                         n_dependence=args.n_dependence_plots,
                         logger=logger,
                     )
-                )
-                write_excel_workbook(
-                    tables={
-                        "top_shap_features": top_features,
-                        "low_contribution_features": low_features,
-                        "shap_status": shap_status,
-                        "feature_family_summary": family,
-                        "selected_neighbours": pd.DataFrame({"query_id": query_id, "neighbour_id": neighbours}),
-                    },
-                    path=query_dir / "query_neighbourhood_explanation_summary.xlsx",
-                    logger=logger,
-                )
-            except Exception as exc:
-                logger.warning("Neighbourhood SHAP failed for %s: %s", query_id, exc)
-                write_table(
-                    data_frame=pd.DataFrame.from_records([{"query_id": query_id, "status": "failed", "message": str(exc)}]),
-                    path=query_dir / "neighbourhood_shap_status.tsv",
-                    logger=logger,
-                )
+                    all_plots.extend(neighbourhood_plots)
+                    query_report_plots.extend(neighbourhood_plots)
+                    write_excel_workbook(
+                        tables={
+                            "top_shap_features": top_features,
+                            "low_contribution_features": low_features,
+                            "shap_status": shap_status,
+                            "feature_family_summary": family,
+                            "selected_neighbours": pd.DataFrame({"query_id": query_id, "neighbour_id": neighbours}),
+                        },
+                        path=query_dir / "query_neighbourhood_explanation_summary.xlsx",
+                        logger=logger,
+                    )
+                except Exception as exc:
+                    logger.warning("Neighbourhood SHAP failed for %s: %s", query_id, exc)
+                    status = pd.DataFrame.from_records(
+                        [{"query_id": query_id, "status": "failed", "message": str(exc)}]
+                    )
+                    write_table(
+                        data_frame=status,
+                        path=query_dir / "neighbourhood_shap_status.tsv",
+                        logger=logger,
+                    )
+                    query_report_tables["Neighbourhood SHAP status"] = status
+
+        if query_report_tables:
+            make_html_report(
+                title=f"CPATK feature explanation report: {query_id}",
+                output_path=query_dir / "query_explanation_report.html",
+                summary_tables=query_report_tables,
+                plot_paths=query_report_plots,
+                narrative=(
+                    f"Feature-level explanation for {query_id}. This report includes any available "
+                    "query-vs-control statistics, query-vs-control SHAP output and local "
+                    "neighbourhood SHAP output."
+                ),
+                methods_text=default_methods_text(),
+                warnings=[
+                    "This report explains features associated with a contrast; it does not prove causality.",
+                    "For default CPATK stress-test shells, query-vs-background uses DMSO/control values when available.",
+                ],
+            )
+
         summary_records.append(
             {
                 "query_id": query_id,
                 "n_selected_neighbours": len(neighbours),
                 "feature_tests_requested": bool(args.run_feature_tests),
+                "query_background_shap_requested": bool(args.run_query_background_shap),
                 "neighbourhood_shap_requested": bool(args.run_neighbourhood_shap),
+                "background_column": args.background_column,
+                "background_values": ",".join(background_values),
             }
         )
     summary = pd.DataFrame.from_records(summary_records)

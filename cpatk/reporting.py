@@ -28,6 +28,49 @@ def _normalise_relative_path(*, path: Path, base_dir: Path) -> str:
         return str(path)
 
 
+def _table_help_text(*, name: str, table: pd.DataFrame) -> str:
+    """Return short plain-language guidance for recognised report tables."""
+    lowered = name.lower()
+    if "metadata" in lowered and "validation" in lowered:
+        return "Checks that assay plate/well metadata are present, unique and not confused with source-transfer plate/well fields."
+    if "profile build" in lowered:
+        return "Summarises how raw CellProfiler image/object tables were merged into one image/profile-level table."
+    if "preprocessing summary" in lowered:
+        return "Records how many profiles/features were retained, how missing values were imputed, and how scaling/normalisation was applied."
+    if "matrix validation" in lowered:
+        return "Confirms the final numeric matrix is finite and safe for downstream PCA, neighbours, MOA and optional AI workflows."
+    if "control qc" in lowered or "reference" in lowered:
+        return "Checks whether the configured control/reference wells are present and usable before reference normalisation."
+    if "replicate" in lowered:
+        return "Shows whether replicate profiles for the same compound are more similar to each other after preprocessing."
+    if "batch" in lowered or "pc association" in lowered:
+        return "Reports how strongly metadata such as plate or compound explains the leading PCs; high plate association may indicate batch structure."
+    if "nearest" in lowered or "neighbour" in lowered:
+        return "Lists the closest profiles or compounds in feature space; useful for checking whether similar treatments group together."
+    if "clipn" in lowered and "preprocessing" in lowered:
+        return "Audits CLIPn-specific matrix preparation, especially missing, NaN and non-finite value handling before latent modelling. Literal zeros are audited but kept by default."
+    if "clipn" in lowered and "status" in lowered:
+        return "Reports whether the CLIPn backend ran, failed, or fell back to PCA diagnostic output."
+    if "pseudo-anchor" in lowered or "moa" in lowered:
+        return "Summarises pseudo-anchor or MOA-style labels. Treat these as hypotheses unless supported by controls and replicate consistency."
+    return "Preview of the linked output table. Use the full TSV/Parquet file for downstream analysis."
+
+
+def _status_badge(*, name: str, table: pd.DataFrame) -> str:
+    """Return a small status badge inferred from common validation columns."""
+    if table.empty:
+        return "<span class='badge muted'>empty</span>"
+    status_cols = [column for column in table.columns if str(column).lower() in {"status", "backend_run"}]
+    text_values = []
+    for column in status_cols:
+        text_values.extend(table[column].dropna().astype(str).str.lower().tolist())
+    if any(value in {"failed", "error", "not_run"} or "fail" in value for value in text_values):
+        return "<span class='badge warn'>review</span>"
+    if any(value in {"ok", "success", "tested"} for value in text_values):
+        return "<span class='badge ok'>ok</span>"
+    return "<span class='badge muted'>table</span>"
+
+
 def _make_table_block(
     *,
     name: str,
@@ -46,10 +89,13 @@ def _make_table_block(
     if table_path is not None:
         href = _normalise_relative_path(path=Path(table_path), base_dir=output_dir or Path.cwd())
         link_block = f"<p class='note'><a href='{html.escape(href)}'>Open full table</a></p>"
+    help_text = html.escape(_table_help_text(name=name, table=table))
+    badge = _status_badge(name=name, table=table)
     return (
         f"<section id='{anchor}' class='table-section'>"
         f"<details open><summary><strong>{escaped}</strong> "
-        f"<span class='pill'>{table.shape[0]} rows × {table.shape[1]} columns</span></summary>"
+        f"<span class='pill'>{table.shape[0]} rows × {table.shape[1]} columns</span> {badge}</summary>"
+        f"<p class='help'>{help_text}</p>"
         f"{row_note}{link_block}{data_frame_to_html_table(data_frame=table, max_rows=max_rows)}</details></section>"
     )
 
@@ -75,23 +121,24 @@ def _make_plot_block(
     path = Path(path)
     display_path, href = _copy_asset_if_requested(path=path, assets_dir=assets_dir)
     title = html.escape(path.stem.replace("_", " "))
+    context = html.escape(path.parent.name.replace("_", " "))
     href_escaped = html.escape(href)
     if path.suffix.lower() == ".svg" and path.exists() and path.stat().st_size <= max_inline_svg_bytes:
         svg_text = path.read_text(encoding="utf-8", errors="replace")
         return (
-            f"<section class='plot'><h3>{title}</h3>"
+            f"<section class='plot'><h3>{title}</h3><p class='note'>From: {context}</p>"
             f"<p class='note'><a href='{href_escaped}'>Open SVG file</a></p>"
             f"<div class='svg-plot'>{svg_text}</div></section>"
         )
     if path.suffix.lower() == ".svg" and path.exists():
         return (
-            f"<section class='plot'><h3>{title}</h3>"
+            f"<section class='plot'><h3>{title}</h3><p class='note'>From: {context}</p>"
             f"<p class='note'>Large SVG not embedded to keep the report readable.</p>"
             f"<p><a href='{href_escaped}'>Open SVG file</a></p></section>"
         )
     if path.suffix.lower() in {".html", ".htm"}:
-        return f"<section class='plot'><h3>{title}</h3><p><a href='{href_escaped}'>Open interactive HTML output</a></p></section>"
-    return f"<section class='plot'><h3>{title}</h3><p><a href='{href_escaped}'>{html.escape(display_path.name)}</a></p></section>"
+        return f"<section class='plot'><h3>{title}</h3><p class='note'>From: {context}</p><p><a href='{href_escaped}'>Open interactive HTML output</a></p></section>"
+    return f"<section class='plot'><h3>{title}</h3><p class='note'>From: {context}</p><p><a href='{href_escaped}'>{html.escape(display_path.name)}</a></p></section>"
 
 
 def _summary_cards(summary_tables: Mapping[str, pd.DataFrame]) -> str:
@@ -186,6 +233,19 @@ def discover_plot_paths(
     return candidates
 
 
+def _quick_reading_guide() -> str:
+    """Return a short report-reading guide."""
+    items = [
+        "Start with metadata validation and profile-build summary before trusting any biology.",
+        "Use preprocessing summaries to check how much data was removed or imputed.",
+        "Compare replicate consistency and batch association before choosing a normalisation strategy.",
+        "Use PCA/UMAP/neighbour plots as the first biological sanity check.",
+        "Treat ML, SHAP, CLIPn and MOA outputs as interpretation layers, not proof on their own.",
+    ]
+    bullets = "".join(f"<li>{html.escape(item)}</li>" for item in items)
+    return f"<section class='guide'><h2>How to read this report</h2><ul>{bullets}</ul></section>"
+
+
 def make_html_report(
     *,
     title: str,
@@ -273,7 +333,13 @@ summary {{ cursor: pointer; margin: 0.8rem 0; }}
 .card {{ border: 1px solid #d8d8d8; border-radius: 0.5rem; padding: 0.8rem; background: #fafafa; }}
 .card-label {{ color: #555; font-size: 0.82rem; }}
 .card-value {{ font-size: 1.2rem; font-weight: 650; margin-top: 0.2rem; word-break: break-word; }}
-.toc {{ background: #f5f5f5; padding: 1rem; border-radius: 0.5rem; }}
+.toc, .guide {{ background: #f5f5f5; padding: 1rem; border-radius: 0.5rem; }}
+.help {{ color: #444; margin: 0.4rem 0 0.7rem 0; }}
+.badge {{ border-radius: 999px; padding: 0.12rem 0.45rem; font-size: 0.72rem; margin-left: 0.35rem; }}
+.badge.ok {{ background: #e8f5e9; color: #1b5e20; }}
+.badge.warn {{ background: #fff3e0; color: #e65100; }}
+.badge.muted {{ background: #eeeeee; color: #555; }}
+.plot-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 1rem; }}
 </style>
 </head>
 <body>
@@ -281,11 +347,12 @@ summary {{ cursor: pointer; margin: 0.8rem 0; }}
 <main>
 <section><h2>Summary</h2><div class='notice'>{html.escape(narrative or 'CPATK report generated successfully.')}</div>{warning_blocks}</section>
 {cards}
+{_quick_reading_guide()}
 {result_map}
 {methods_block}
 <section class='toc'><h2>Table index</h2><ul>{table_toc}</ul></section>
 <section><h2>Summary tables</h2>{table_blocks}</section>
-<section id='plots-and-interactive-outputs'><h2>Plots and interactive outputs</h2>{plot_blocks}</section>
+<section id='plots-and-interactive-outputs'><h2>Plots and interactive outputs</h2><div class='plot-grid'>{plot_blocks}</div></section>
 </main>
 </body>
 </html>
@@ -302,13 +369,13 @@ def default_methods_text() -> str:
         "object counts and image dimensions are not treated as biological morphology features unless explicitly requested.\n\n"
         "The report is a map into the results folder, not a replacement for the full outputs. Small previews are shown in the HTML. "
         "The full TSV or Parquet files should be used for downstream analysis and archiving.\n\n"
-        "Preprocessing applies feature-level and profile-level QC before imputation. After all CellProfiler tables have been merged, rows whose observed retained feature values are all zero are removed by default, because these usually represent failed/empty profiles rather than valid morphology. Median imputation is the default because "
+        "Preprocessing applies feature-level and profile-level QC before imputation. After all CellProfiler tables have been merged, rows whose observed retained feature values are all zero are removed by default, because these usually represent failed/empty profiles rather than valid morphology. For CLIPn, missing/NA/non-finite values are the problem; real zero values are audited but kept by default. Median imputation is the default because "
         "it is robust and avoids borrowing structure across treatments. Group-median, mean, zero and KNN imputation are available, "
         "but KNN imputation should be used cautiously because it can smooth real batch or perturbation structure.\n\n"
         "Optional control/reference normalisation can centre profiles against reference wells such as DMSO within each plate or batch. "
         "This is often useful in Cell Painting, but it is disabled by default because it depends on correctly annotated controls and an appropriate design.\n\n"
         "Classical analysis uses PCA, optional UMAP and t-SNE, pairwise distances, nearest neighbours and clustering. "
-        "These methods provide a non-AI analysis route and are also important QC before any AI/CLIPn workflow.\n\n"
+        "These methods provide a non-AI analysis route and are also important QC before any AI/CLIPn workflow. MOA analysis can be run on the classical preprocessed feature space and, optionally, on a CLIPn latent space; the latter is labelled separately because it answers a different question.\n\n"
         "Replicate reproducibility is assessed by within-group profile correlations. Neighbour stability and cluster stability are assessed by bootstrap resampling. "
         "Cluster permutation testing compares the observed silhouette score with scores obtained after feature-wise permutation, which helps determine whether clustering is stronger than expected from marginal feature distributions alone.\n\n"
         "MOA classification can be performed using centroid similarity, KNN and supervised machine-learning models such as random forests, extra trees, gradient boosting, logistic regression and calibrated linear SVMs. "

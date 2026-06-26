@@ -619,7 +619,7 @@ at making the output easier to interpret.
 For CLIPn smoke tests, the example shells no longer drop every row containing
 any zero by default, because this was too strict for real preprocessed Cell
 Painting matrices and could leave zero samples. The strict mode is still
-available by setting `CLIPN_STRICT_DROP_ANY_ZERO=1`.
+available by setting `CLIPN_STRICT_DROP_ANY_ZERO=1`, but this is usually too aggressive. CLIPn can accept real zeros; CPATK now focuses on removing/imputing missing, NA and non-finite values before CLIPn.
 
 ## v0.2.15 note: macOS sidecar files and cluster SciPy imports
 
@@ -633,3 +633,18 @@ The acquisition-drift module now imports SciPy lazily for Spearman p-values and
 falls back to a NumPy/pandas Spearman rho if `scipy.stats` cannot be imported in
 a problematic HPC environment. Full drift QC, ML and PCA/UMAP workflows still
 need a working SciPy/scikit-learn stack for production analysis.
+
+
+### v0.2.17 report and CLIPn update
+
+CPATK v0.2.17 makes the reporting layer more useful for real project review. Classical analysis now writes a verbose `classical_analysis_report.html`, interactive PCA, compound-level distance heatmaps and a hierarchically clustered version of the compound heatmap when an ID column is available. The final report uses the plainer `Summary` heading and automatically links more tables, plots and subreports.
+
+For CLIPn, literal zero values are now audited but kept by default. CLIPn can accept zeros; the important requirement is that the matrix contains no missing, NA or non-finite values after CPATK imputation and scaling. The old `--drop_rows_with_any_zero` behaviour remains available only as a strict debugging option.
+
+The malaria and mitotox stress-test shells now run query-vs-control explanations by default for the configured compounds, using DMSO as the default control where present. They also run an optional MOA-style pseudo-anchor analysis on CLIPn latent space if CLIPn produces a latent table. This latent-space MOA is reported separately and does not replace the feature-space MOA analysis.
+
+### v0.2.18 review hardening
+
+CPATK v0.2.18 is a review pass over the larger v0.2.17 reporting and CLIPn update. It does not change the intended biological workflow. It clarifies that CLIPn can accept real zero values, and that CPATK only removes all-zero rows/features as an empty-signal QC step. Missing, NA, NaN and non-finite values remain the values that must be cleaned before CLIPn. The fast malaria and mitotox stress-test shells no longer pass the deprecated `--clipn_zero_epsilon` argument, to avoid implying that zeros are epsilon-replaced.
+
+The query-vs-background explanation summary now records whether query-vs-control SHAP was requested and which background column/values were used. Logging setup was also tightened so repeated CLI calls in the same Python process close old file handlers cleanly.

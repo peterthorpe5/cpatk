@@ -12,6 +12,8 @@ from cpatk.features import parse_column_list, split_metadata_and_features
 from cpatk.io import read_table, write_excel_workbook, write_table
 from cpatk.logging_utils import configure_logging
 from cpatk.plotting import plot_embedding, plot_heatmap, plot_pca_variance, write_interactive_embedding_html, write_interactive_heatmap_html
+from cpatk.reporting import default_methods_text, make_html_report
+from cpatk.visualisation import draw_clustered_heatmap
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -108,6 +110,15 @@ def main() -> None:
         logger=logger,
     )
     write_interactive_embedding_html(
+        embedding=pca_scores,
+        metadata=metadata,
+        x_column="PC1",
+        y_column="PC2",
+        colour_column=args.colour_column,
+        output_path=output_dir / "interactive_pca_plot.html",
+        logger=logger,
+    )
+    write_interactive_embedding_html(
         embedding=embedding,
         metadata=metadata,
         x_column=x_column,
@@ -143,6 +154,98 @@ def main() -> None:
             title="Pairwise profile distances",
             logger=logger,
         )
+
+    if args.id_column and args.id_column in metadata.columns:
+        try:
+            grouped = features.copy()
+            grouped[args.id_column] = metadata[args.id_column].astype(str).values
+            grouped_features = grouped.groupby(args.id_column, dropna=False).median(numeric_only=True)
+            if 1 < grouped_features.shape[0] <= 300:
+                compound_distances = calculate_pairwise_distance_matrix(
+                    features=grouped_features,
+                    metric=args.distance_metric,
+                )
+                write_table(
+                    data_frame=compound_distances,
+                    path=output_dir / "compound_pairwise_distances.tsv",
+                    index=True,
+                    logger=logger,
+                )
+                plot_heatmap(
+                    matrix=compound_distances,
+                    output_path_base=output_dir / "compound_pairwise_distance_heatmap",
+                    title="Compound-level pairwise distances",
+                    value_label=args.distance_metric,
+                    logger=logger,
+                )
+                clustered, row_order, col_order, _ = draw_clustered_heatmap(
+                    matrix=compound_distances,
+                    output_path_base=output_dir / "compound_pairwise_distance_heatmap_clustered",
+                    title="Compound-level pairwise distances, hierarchically clustered",
+                    cluster_rows=True,
+                    cluster_columns=True,
+                    distance="euclidean",
+                    zscore="none",
+                    max_rows=300,
+                    logger=logger,
+                )
+                write_table(
+                    data_frame=clustered,
+                    path=output_dir / "compound_pairwise_distance_heatmap_clustered_matrix.tsv",
+                    index=True,
+                    logger=logger,
+                )
+                write_table(
+                    data_frame=row_order,
+                    path=output_dir / "compound_pairwise_distance_heatmap_row_order.tsv",
+                    logger=logger,
+                )
+                write_table(
+                    data_frame=col_order,
+                    path=output_dir / "compound_pairwise_distance_heatmap_column_order.tsv",
+                    logger=logger,
+                )
+        except Exception as exc:
+            logger.warning("Compound-level distance heatmaps skipped: %s", exc)
+
+    summary_tables = {
+        "PCA explained variance": pca_variance,
+        "Nearest neighbours": neighbours.head(200),
+        "KMeans cluster summary": cluster_summary,
+        "Cluster silhouette summary": silhouette,
+    }
+    table_paths = {
+        "PCA explained variance": output_dir / "pca_explained_variance.tsv",
+        "Nearest neighbours": output_dir / "nearest_neighbours.tsv",
+        "KMeans cluster summary": output_dir / "cluster_summary.tsv",
+        "Cluster silhouette summary": output_dir / "cluster_silhouette_summary.tsv",
+    }
+    for optional_name, optional_path in [
+        ("Compound pairwise distances", output_dir / "compound_pairwise_distances.tsv"),
+        ("Compound clustered heatmap row order", output_dir / "compound_pairwise_distance_heatmap_row_order.tsv"),
+        ("Compound clustered heatmap column order", output_dir / "compound_pairwise_distance_heatmap_column_order.tsv"),
+    ]:
+        if optional_path.exists():
+            summary_tables[optional_name] = read_table(path=optional_path, logger=logger)
+            table_paths[optional_name] = optional_path
+    plot_paths = sorted(output_dir.glob("*.svg")) + sorted(output_dir.glob("*.html"))
+    make_html_report(
+        title="CPATK classical analysis report",
+        output_path=output_dir / "classical_analysis_report.html",
+        summary_tables=summary_tables,
+        table_paths=table_paths,
+        plot_paths=plot_paths,
+        narrative=(
+            "Classical CPATK analysis generated PCA, interactive PCA/embedding output, "
+            "nearest-neighbour tables, clustering summaries and compound-level distance heatmaps. "
+            "Use this as the main non-AI sanity check before interpreting MOA, SHAP or CLIPn outputs."
+        ),
+        methods_text=default_methods_text(),
+        warnings=[
+            "Classical plots are descriptive QC/interpretation tools; they do not prove mechanism on their own.",
+            "Compound-level heatmaps are based on median aggregated profiles when an ID column is available.",
+        ],
+    )
     logger.info("CPATK classical workflow complete")
 
 

@@ -90,8 +90,8 @@ class TestClipnFilteringMessageV0216(unittest.TestCase):
             "a": pd.DataFrame({"id": ["a1", "a2"]}),
             "b": pd.DataFrame({"id": ["b1", "b2"]}),
         }
-        config = ClipnAdapterConfig(drop_rows_with_any_zero=True)
-        with self.assertRaisesRegex(ValueError, "No CLIPn samples remained"):
+        config = ClipnAdapterConfig(drop_rows_with_any_zero=True, scaling_method="none")
+        with self.assertRaisesRegex(ValueError, "removed every sample"):
             clean_impute_and_scale_aligned(
                 aligned=aligned,
                 metadata=metadata,
