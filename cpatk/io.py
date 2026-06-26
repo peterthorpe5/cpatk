@@ -17,6 +17,10 @@ from openpyxl.styles import Font, PatternFill, Alignment
 
 TableLike = Union[pd.DataFrame, Mapping[str, pd.DataFrame]]
 
+EXCEL_MAX_ROWS = 1_048_576
+EXCEL_MAX_COLUMNS = 16_384
+DEFAULT_EXCEL_PREVIEW_ROWS = 100_000
+
 
 def is_ignored_sidecar_path(*, path: Union[str, Path]) -> bool:
     """Return whether a path should be ignored during table discovery.
@@ -151,11 +155,55 @@ def sanitise_sheet_name(*, sheet_name: str) -> str:
     return cleaned[:31]
 
 
+def _unique_sheet_name(*, sheet_name: str, used_names: set[str]) -> str:
+    """Return a unique, Excel-safe sheet name."""
+    safe_name = sanitise_sheet_name(sheet_name=sheet_name)
+    base_name = safe_name
+    counter = 1
+    while safe_name in used_names:
+        suffix = f"_{counter}"
+        safe_name = f"{base_name[:31 - len(suffix)]}{suffix}"
+        counter += 1
+    used_names.add(safe_name)
+    return safe_name
+
+
+def _excel_safe_preview(
+    *,
+    table: pd.DataFrame,
+    max_preview_rows: int,
+) -> tuple[pd.DataFrame, dict[str, Union[str, int, bool]]]:
+    """Return an Excel-safe preview and an audit record for a table.
+
+    Excel is used by CPATK as a readable summary format. Lossless exports are
+    the TSV/Parquet files written beside each workbook. Very large tables are
+    therefore previewed in Excel rather than causing the whole workflow to fail.
+    """
+    original_rows = int(table.shape[0])
+    original_columns = int(table.shape[1])
+    max_data_rows = max(0, min(max_preview_rows, EXCEL_MAX_ROWS - 1))
+    max_columns = EXCEL_MAX_COLUMNS
+    truncated_rows = original_rows > max_data_rows
+    truncated_columns = original_columns > max_columns
+    preview = table.iloc[:max_data_rows, :max_columns].copy()
+    record: dict[str, Union[str, int, bool]] = {
+        "original_rows": original_rows,
+        "original_columns": original_columns,
+        "rows_written_to_excel": int(preview.shape[0]),
+        "columns_written_to_excel": int(preview.shape[1]),
+        "truncated_rows": bool(truncated_rows),
+        "truncated_columns": bool(truncated_columns),
+        "reason": "previewed_for_excel_limit" if truncated_rows or truncated_columns else "complete",
+    }
+    return preview, record
+
+
 def write_excel_workbook(
     *,
     tables: Mapping[str, pd.DataFrame],
     path: Union[str, Path],
     logger: Optional[logging.Logger] = None,
+    max_preview_rows: int = DEFAULT_EXCEL_PREVIEW_ROWS,
 ) -> Path:
     """Write a formatted Excel workbook with one sheet per table.
 
@@ -167,6 +215,10 @@ def write_excel_workbook(
         Output workbook path.
     logger:
         Optional logger.
+    max_preview_rows:
+        Maximum number of data rows to write for an individual Excel sheet.
+        TSV/Parquet outputs remain the lossless data exports; Excel sheets are
+        readable summaries and are previewed when tables are too large.
 
     Returns
     -------
@@ -178,20 +230,35 @@ def write_excel_workbook(
     if logger is not None:
         logger.info("Writing formatted Excel workbook: %s", path)
 
+    export_notes: list[dict[str, Union[str, int, bool]]] = []
     with pd.ExcelWriter(path=path, engine="openpyxl") as writer:
-        used_names = set()
+        used_names: set[str] = set()
         for sheet_name, table in tables.items():
-            safe_name = sanitise_sheet_name(sheet_name=sheet_name)
-            base_name = safe_name
-            counter = 1
-            while safe_name in used_names:
-                suffix = f"_{counter}"
-                safe_name = f"{base_name[:31 - len(suffix)]}{suffix}"
-                counter += 1
-            used_names.add(safe_name)
-            table.to_excel(excel_writer=writer, sheet_name=safe_name, index=False)
+            safe_name = _unique_sheet_name(sheet_name=sheet_name, used_names=used_names)
+            preview, note = _excel_safe_preview(table=table, max_preview_rows=max_preview_rows)
+            note["requested_sheet_name"] = str(sheet_name)
+            note["excel_sheet_name"] = safe_name
+            export_notes.append(note)
+            if note["reason"] != "complete" and logger is not None:
+                logger.warning(
+                    "Excel sheet '%s' is too large for a readable workbook; "
+                    "writing preview rows=%s columns=%s from original rows=%s columns=%s.",
+                    sheet_name,
+                    note["rows_written_to_excel"],
+                    note["columns_written_to_excel"],
+                    note["original_rows"],
+                    note["original_columns"],
+                )
+            preview.to_excel(excel_writer=writer, sheet_name=safe_name, index=False)
             worksheet = writer.sheets[safe_name]
-            format_worksheet(worksheet=worksheet, data_frame=table)
+            format_worksheet(worksheet=worksheet, data_frame=preview)
+
+        if export_notes:
+            notes_name = _unique_sheet_name(sheet_name="Excel_export_notes", used_names=used_names)
+            notes_table = pd.DataFrame.from_records(export_notes)
+            notes_table.to_excel(excel_writer=writer, sheet_name=notes_name, index=False)
+            worksheet = writer.sheets[notes_name]
+            format_worksheet(worksheet=worksheet, data_frame=notes_table)
     return path
 
 

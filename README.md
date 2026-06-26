@@ -2,7 +2,7 @@
 
 CPATK is a generic, extensible toolkit for Cell Painting / high-content profiling analysis. It supports defensive preprocessing, QC, classical analysis, optional CLIPn/AI integration, replicate and cluster stability, batch/domain-shift diagnostics, MOA classification, feature attribution and HTML/Excel reporting.
 
-Version: **0.2.15**
+Version: **0.2.16**
 
 ## Design principles
 
@@ -15,74 +15,18 @@ Version: **0.2.15**
 
 ## Installation
 
-For a lightweight CPATK-only development install:
-
 ```bash
-cd cpatk_v0_2_15_full
+cd cpatk_v0_2_11_full
 python -m pip install -e .
-
 env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
-  python -m unittest discover -s tests -q
+  python -m unittest discover -s tests -v
 ```
 
-For the full CPATK + CLIPn + AI/ML environment on the cluster, use the confirmed Python 3.10 environment recipe in:
-
-```text
-docs/CPATK_CONFIRMED_CLUSTER_INSTALLATION_GUIDE.md
-examples/create_cpatk_confirmed_cluster_env.sh
-```
-
-The confirmed cluster environment was named `cpatk` and passed the full CPATK unit-test suite:
-
-```text
-Ran 179 tests in 19.218s
-OK
-```
-
-The key pinned choices are:
-
-```text
-python=3.10
-numpy=1.26.4
-pandas=2.0
-scipy=1.13.1
-scikit-learn=1.6.1
-umap-learn=0.5.8
-pytorch==2.1.2
-torchvision==0.16.2
-torchaudio==2.1.2
-pytorch-cuda=11.8
-```
-
-The full environment should be built with conda-forge/mamba for compiled scientific packages, then pip only for the packages that are not cleanly available through conda. Use `--no-deps` for these pip packages so pip does not overwrite the conda-built numerical stack:
+Optional dependencies:
 
 ```bash
-python -m pip install --no-deps kmapper
-python -m pip install --no-deps clipn
-python -m pip install --no-deps copairs
-python -m pip install --no-deps onnx==1.14.1 onnxruntime==1.16.3
+python -m pip install pyarrow plotly umap-learn shap
 ```
-
-The following additional packages must also be present; install these via conda-forge/mamba, not pip:
-
-```text
-duckdb
-statsmodels
-protobuf
-coloredlogs
-flatbuffers
-fsspec
-tqdm
-```
-
-After activating the environment in an SGE job, use:
-
-```bash
-export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
-export LD_PRELOAD="${CONDA_PREFIX}/lib/libstdc++.so.6${LD_PRELOAD:+:${LD_PRELOAD}}"
-```
-
-This avoids common cluster failures where SciPy or scikit-learn accidentally load the system `libstdc++` rather than the conda environment copy.
 
 `pyarrow` enables Parquet output. Without it, CPATK falls back to `.tsv.gz` and logs the reason.
 
@@ -152,7 +96,6 @@ The safest first analysis is deliberately classical: metadata validation, profil
 The following documents give more detailed practical guidance than the README:
 
 ```text
-docs/CPATK_CONFIRMED_CLUSTER_INSTALLATION_GUIDE.md
 docs/CPATK_USER_GUIDE.md
 docs/CPATK_METHOD_SELECTION_GUIDE.md
 docs/CPATK_METADATA_AND_ANNOTATION_GUIDE.md
@@ -658,6 +601,25 @@ CPATK now includes safer native support for multi-plate CellProfiler workflows:
 - before/after replicate and batch PC-association reports using `--replicate_group_columns` and `--batch_report_columns`.
 
 See `docs/CPATK_v0_2_12_multi_plate_batch_release.md` and `examples/run_cpatk_multi_plate_recommended_workflow.sh`.
+
+
+## v0.2.16 reporting and large-workbook hardening
+
+CPATK v0.2.16 fixes failures seen during real malaria and mitotox stress tests.
+Excel workbooks are now treated as readable summaries, not lossless exports: very
+large sheets are previewed and an `Excel_export_notes` sheet records the original
+shape and whether a sheet was truncated. Full data remain available in the TSV or
+Parquet files written beside the workbook.
+
+The HTML report heading now uses the plainer `Summary` wording. The
+report generator also auto-discovers nearby plots by default, adds links back to
+full source tables, includes a clearer results map, and uses plainer text aimed
+at making the output easier to interpret.
+
+For CLIPn smoke tests, the example shells no longer drop every row containing
+any zero by default, because this was too strict for real preprocessed Cell
+Painting matrices and could leave zero samples. The strict mode is still
+available by setting `CLIPN_STRICT_DROP_ANY_ZERO=1`.
 
 ## v0.2.15 note: macOS sidecar files and cluster SciPy imports
 

@@ -10,7 +10,7 @@
 ##$ -adds l_hard gpu 1
 ##$ -adds l_hard cuda.0.name 'NVIDIA A40'
 
-# CPATK v0.2.15 fast mitotox Cell Painting stress-test workflow.
+# CPATK v0.2.16 fast mitotox Cell Painting stress-test workflow.
 #
 # This is designed as a broad validation/stress test rather than a final
 # biological analysis. It stages inputs to job-local scratch, prefers Parquet
@@ -32,7 +32,7 @@ RAW_METADATA="${RAW_METADATA:-${BASE_DIR}/metadata/KVP_MitotoxPlate_IXM_07042025
 PREMERGED_PROFILE_TABLE="${PREMERGED_PROFILE_TABLE:-${BASE_DIR}/mitotox_all_plates_image_level.tsv}"
 
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-PROJECT_OUT_DIR="${PROJECT_OUT_DIR:-${OUT_DIR:-${BASE_DIR}/cpatk_v0_2_15_mitotox_fast_${RUN_TAG}}}"
+PROJECT_OUT_DIR="${PROJECT_OUT_DIR:-${OUT_DIR:-${BASE_DIR}/cpatk_v0_2_16_mitotox_fast_${RUN_TAG}}}"
 
 USE_LOCAL_SCRATCH="${USE_LOCAL_SCRATCH:-1}"
 COPY_INPUTS_TO_SCRATCH="${COPY_INPUTS_TO_SCRATCH:-1}"
@@ -76,7 +76,7 @@ RUN_FINAL_REPORT="${RUN_FINAL_REPORT:-1}"
 # CLIPn settings.
 CLIPN_LATENT_DIM="${CLIPN_LATENT_DIM:-10}"
 CLIPN_EPOCHS="${CLIPN_EPOCHS:-80}"
-CLIPN_STRICT_DROP_ANY_ZERO="${CLIPN_STRICT_DROP_ANY_ZERO:-1}"
+CLIPN_STRICT_DROP_ANY_ZERO="${CLIPN_STRICT_DROP_ANY_ZERO:-0}"
 CLIPN_ALLOW_PCA_FALLBACK="${CLIPN_ALLOW_PCA_FALLBACK:-1}"
 
 # Lightweight first-pass settings. Increase for final analyses.
@@ -899,7 +899,7 @@ if [[ "${RUN_CLIPN}" == "1" ]] && command -v cpatk-clipn >/dev/null 2>&1; then
     cpatk-clipn \
       --dataset "mitotox=${PRIMARY_TABLE}" \
       --output_dir "${OUT_DIR}/12_clipn" \
-      --experiment mitotox_cpatk_v0_2_15_fast \
+      --experiment mitotox_cpatk_v0_2_16_fast \
       --mode integrate_all \
       --split_single_dataset_by_column Metadata_Compound \
       --single_dataset_split_names reference_like,query_like \
@@ -924,9 +924,9 @@ fi
 if [[ "${RUN_FINAL_REPORT}" == "1" ]]; then
   section "Step 07: final HTML report index"
   REPORT_ARGS=(
-    --output_html "${OUT_DIR}/CPATK_mitotox_v0_2_15_fast_full_report.html"
-    --title "CPATK v0.2.15 mitotox Cell Painting stress-test report"
-    --narrative "End-to-end CPATK v0.2.15 stress test on mitotox Cell Painting data. Review metadata merge rates, profile-building/fallback status, preprocessing strategy comparison, replicate QC, batch QC, classical plots, neighbour tables, pseudo-anchor labels and optional ML/CLIPn/explainability outputs before interpreting biology."
+    --output_html "${OUT_DIR}/CPATK_mitotox_v0_2_16_fast_full_report.html"
+    --title "CPATK v0.2.16 mitotox Cell Painting stress-test report"
+    --narrative "End-to-end CPATK v0.2.16 stress test on mitotox Cell Painting data. Review metadata merge rates, profile-building/fallback status, preprocessing strategy comparison, replicate QC, batch QC, classical plots, neighbour tables, pseudo-anchor labels and optional ML/CLIPn/explainability outputs before interpreting biology."
     --warning "This is a validation workflow. Optional modules are allowed to fail so that earlier QC and preprocessing outputs are preserved."
     --warning "The ML section uses compound IDs as labels for a software smoke test unless a genuine MOA label column is supplied."
     --log_level "${LOG_LEVEL}"
@@ -955,4 +955,4 @@ echo "Scratch output directory: ${OUT_DIR}"
 echo "Project output directory: ${PROJECT_OUT_DIR}"
 echo "Primary strategy: ${PRIMARY_STRATEGY}"
 echo "Primary preprocessed table: ${PRIMARY_TABLE}"
-echo "Primary report on project filesystem: ${PROJECT_OUT_DIR}/CPATK_mitotox_v0_2_15_fast_full_report.html"
+echo "Primary report on project filesystem: ${PROJECT_OUT_DIR}/CPATK_mitotox_v0_2_16_fast_full_report.html"

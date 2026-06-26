@@ -616,6 +616,30 @@ def clean_impute_and_scale_aligned(
 
     if not feature_cols:
         raise ValueError("No CLIPn features remained after missingness/zero filtering.")
+    if table.empty:
+        message = (
+            "No CLIPn samples remained after missingness/zero filtering. "
+            "If --drop_rows_with_any_zero was used, rerun without that strict option; "
+            "real Cell Painting matrices often contain some zero-valued measurements "
+            "even after valid preprocessing."
+        )
+        if logger is not None:
+            logger.error(message)
+        raise ValueError(message)
+    empty_datasets = [
+        name
+        for name in aligned
+        if int((table["Dataset"] == name).sum()) == 0
+    ]
+    if empty_datasets:
+        message = (
+            "One or more CLIPn datasets have no samples after filtering: "
+            f"{', '.join(empty_datasets)}. "
+            "Relax missingness/zero filtering or rerun without --drop_rows_with_any_zero."
+        )
+        if logger is not None:
+            logger.error(message)
+        raise ValueError(message)
     n_missing_before = int(table[feature_cols].isna().sum().sum()) if feature_cols else 0
     if config.imputation_method == "none":
         pass
