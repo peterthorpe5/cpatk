@@ -9,7 +9,8 @@ preprocessing.
 The safest default is:
 
 * use the Image table as the row-level backbone where possible;
-* aggregate each object table to ``ImageNumber`` before merging;
+* propagate image-level assay keys onto object tables when safe;
+* aggregate each object table to image/profile-level before merging;
 * do not blindly merge object tables by ``ObjectNumber`` across compartments;
 * merge external plate/well metadata using canonical metadata aliases; and
 * write every table role, merge key, aggregation and unmatched-row decision.
@@ -231,6 +232,156 @@ def _coerce_and_clean_table(*, data_frame: pd.DataFrame, logger: Optional[loggin
     inventory = make_column_inventory(data_frame=cleaned)
     return cleaned, column_report, dropped_report, alias_report, inventory
 
+
+
+def _can_propagate_object_key(column: str) -> bool:
+    """Return whether an image-level key is safe to stamp onto object rows."""
+    if column in {"Metadata_Plate", "Metadata_Well", "Plate_Metadata", "Well_Metadata"}:
+        return True
+    return column.startswith("Metadata_") and not column.startswith("Metadata_Source_")
+
+
+def _candidate_object_key_propagation_columns(
+    *,
+    profiles: pd.DataFrame,
+    object_table: pd.DataFrame,
+    requested_keys: Optional[Sequence[str] | str] = None,
+) -> Tuple[List[str], bool]:
+    """Choose image-level keys that may be propagated to an object table.
+
+    Returns the missing key columns and whether they came from an explicit user
+    request. Explicit keys are treated more strictly because the user has asked
+    for a particular merge policy, usually for multi-plate safety.
+    """
+    requested = _parse_merge_key_list(requested_keys)
+    explicit = requested is not None
+    if requested is None:
+        requested = ["Metadata_Plate", "Metadata_Well", "ImageNumber"]
+    missing = [
+        key
+        for key in requested
+        if key != "ImageNumber"
+        and key in profiles.columns
+        and key not in object_table.columns
+        and _can_propagate_object_key(key)
+    ]
+    return missing, explicit
+
+
+def _propagate_image_keys_to_object_table(
+    *,
+    object_table: pd.DataFrame,
+    profiles: pd.DataFrame,
+    table_label: str,
+    requested_keys: Optional[Sequence[str] | str] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Propagate image-level assay keys to an object table when safe.
+
+    CellProfiler object tables commonly contain ``ImageNumber`` and
+    ``ObjectNumber`` but do not repeat assay-level metadata such as
+    ``Metadata_Plate`` and ``Metadata_Well``. When the image/profile backbone
+    has a unique mapping from ``ImageNumber`` to these metadata keys, CPATK can
+    safely stamp the keys onto object rows before aggregation. This allows
+    multi-plate composite keys such as ``Metadata_Plate,ImageNumber`` without
+    requiring the raw object tables to already contain ``Metadata_Plate``.
+
+    The function deliberately refuses ambiguous mappings. If ``ImageNumber`` is
+    associated with more than one plate/well value in the backbone, there is no
+    safe way to infer the missing key for an object row that only has
+    ``ImageNumber``.
+    """
+    missing_keys, explicit = _candidate_object_key_propagation_columns(
+        profiles=profiles,
+        object_table=object_table,
+        requested_keys=requested_keys,
+    )
+    base_record = {
+        "table_label": table_label,
+        "requested_keys": ";".join(_parse_merge_key_list(requested_keys) or []),
+        "propagated_keys": ";".join(missing_keys),
+        "n_object_rows": int(object_table.shape[0]),
+        "n_profile_rows": int(profiles.shape[0]),
+    }
+    if not missing_keys:
+        report = pd.DataFrame.from_records([
+            {
+                **base_record,
+                "status": "not_needed",
+                "reason": "No missing image-level merge keys needed propagation.",
+                "n_mapping_rows": 0,
+                "n_conflicting_image_numbers": 0,
+                "n_object_rows_missing_propagated_keys": 0,
+            }
+        ])
+        return object_table, report
+    if "ImageNumber" not in object_table.columns or "ImageNumber" not in profiles.columns:
+        message = (
+            f"Object table {table_label} is missing image-level keys {missing_keys}, "
+            "but ImageNumber is not available on both the object table and profile backbone."
+        )
+        if explicit:
+            raise ValueError(message)
+        report = pd.DataFrame.from_records([
+            {
+                **base_record,
+                "status": "skipped_missing_ImageNumber",
+                "reason": message,
+                "n_mapping_rows": 0,
+                "n_conflicting_image_numbers": 0,
+                "n_object_rows_missing_propagated_keys": 0,
+            }
+        ])
+        return object_table, report
+    mapping = profiles.loc[:, ["ImageNumber", *missing_keys]].drop_duplicates()
+    conflicting_mask = mapping.duplicated(subset=["ImageNumber"], keep=False)
+    n_conflicting = int(mapping.loc[conflicting_mask, "ImageNumber"].nunique())
+    if n_conflicting:
+        message = (
+            f"Cannot safely propagate {missing_keys} to object table {table_label}: "
+            f"{n_conflicting} ImageNumber value(s) map to multiple image-level key values. "
+            "Object tables must contain the plate/export key, or the input should be split per plate/export."
+        )
+        if explicit:
+            raise ValueError(message)
+        report = pd.DataFrame.from_records([
+            {
+                **base_record,
+                "status": "skipped_ambiguous_ImageNumber_mapping",
+                "reason": message,
+                "n_mapping_rows": int(mapping.shape[0]),
+                "n_conflicting_image_numbers": n_conflicting,
+                "n_object_rows_missing_propagated_keys": 0,
+            }
+        ])
+        if logger is not None:
+            logger.warning(message)
+        return object_table, report
+    propagated = object_table.merge(mapping, on="ImageNumber", how="left", validate="many_to_one")
+    missing_after = int(propagated.loc[:, missing_keys].isna().any(axis=1).sum())
+    report = pd.DataFrame.from_records([
+        {
+            **base_record,
+            "status": "propagated",
+            "reason": "Image-level keys were propagated from the profile backbone using a unique ImageNumber mapping.",
+            "n_mapping_rows": int(mapping.shape[0]),
+            "n_conflicting_image_numbers": 0,
+            "n_object_rows_missing_propagated_keys": missing_after,
+        }
+    ])
+    if logger is not None:
+        logger.info(
+            "Propagated image-level keys to object table %s using ImageNumber: %s",
+            table_label,
+            ";".join(missing_keys),
+        )
+        if missing_after:
+            logger.warning(
+                "Object table %s has %s row(s) with missing propagated image-level keys.",
+                table_label,
+                missing_after,
+            )
+    return propagated, report
 
 def _aggregate_object_table(
     *,
@@ -705,6 +856,7 @@ def build_profiles_from_folder(
 
     aggregation_reports: List[pd.DataFrame] = []
     object_column_reports: List[pd.DataFrame] = []
+    object_key_propagation_reports: List[pd.DataFrame] = []
     for object_path in object_paths:
         if object_path.resolve() == backbone_path.resolve():
             continue
@@ -716,6 +868,14 @@ def build_profiles_from_folder(
         )
         column_report.insert(0, "table_label", table_label)
         object_column_reports.append(column_report)
+        object_clean, key_propagation_report = _propagate_image_keys_to_object_table(
+            object_table=object_clean,
+            profiles=profiles,
+            table_label=table_label,
+            requested_keys=image_merge_keys,
+            logger=logger,
+        )
+        object_key_propagation_reports.append(key_propagation_report)
         object_merge_keys = choose_profile_merge_keys(
             left=profiles,
             right=object_clean,
@@ -782,8 +942,19 @@ def build_profiles_from_folder(
             {"item": "n_columns", "value": int(profiles.shape[1])},
             {"item": "n_inferred_feature_columns", "value": int(len(feature_columns))},
             {
+                "item": "n_object_tables_with_image_key_propagation",
+                "value": int(sum(
+                    1
+                    for report in object_key_propagation_reports
+                    if not report.empty and str(report.loc[0, "status"]) == "propagated"
+                )),
+            },
+            {
                 "item": "object_merge_policy",
-                "value": "object tables aggregated to ImageNumber before merging; no cross-compartment ObjectNumber merge",
+                "value": (
+                    "object tables are first stamped with image-level assay keys when a unique ImageNumber mapping is available, "
+                    "then aggregated to image/profile-level; no cross-compartment ObjectNumber merge"
+                ),
             },
         ]
     )
@@ -799,6 +970,7 @@ def build_profiles_from_folder(
         "final_profile_column_inventory": final_inventory,
         "retained_profile_features": pd.DataFrame({"feature": feature_columns}),
         "object_aggregation_report": pd.concat(aggregation_reports, ignore_index=True) if aggregation_reports else pd.DataFrame(),
+        "object_key_propagation_report": pd.concat(object_key_propagation_reports, ignore_index=True) if object_key_propagation_reports else pd.DataFrame(),
         "object_column_name_report": pd.concat(object_column_reports, ignore_index=True) if object_column_reports else pd.DataFrame(),
         "metadata_merge_report": pd.concat(metadata_reports, ignore_index=True) if metadata_reports else pd.DataFrame(),
     }
@@ -826,8 +998,9 @@ def _write_profile_build_outputs(
     excel_tables = {**tables, "merged_profiles_preview": profiles.head(5000)}
     write_excel_workbook(tables=excel_tables, path=output_dir / "profile_build_summary.xlsx", logger=logger)
     warnings = [
-        "Object-level tables are aggregated to ImageNumber before merging. This avoids unsafe cross-compartment ObjectNumber joins.",
-        "Review the metadata_merge_report for unmatched profiles or duplicate plate/well metadata keys.",
+        "Object-level tables are stamped with image-level assay keys before aggregation when a unique ImageNumber mapping is available.",
+        "If ImageNumber is ambiguous across plates and object tables lack plate/export keys, CPATK refuses to infer those keys.",
+        "Review object_key_propagation_report and metadata_merge_report before interpreting profile-level outputs.",
     ]
     make_html_report(
         title="CPATK profile-build report",
@@ -835,13 +1008,15 @@ def _write_profile_build_outputs(
         summary_tables={**tables, "Merged profile preview": profiles.head(50)},
         narrative=(
             "CPATK built an analysis-ready profile table from a folder of Cell Painting exports. "
-            "The workflow used an image/profile table as the row-level backbone, aggregated object-level tables to ImageNumber, "
-            "merged optional external plate/well metadata, and wrote audit tables for every decision."
+            "The workflow used an image/profile table as the row-level backbone, propagated image-level assay keys "
+            "to object tables when this could be done through a unique ImageNumber mapping, aggregated object-level tables "
+            "to image/profile level, merged optional external plate/well metadata, and wrote audit tables for every decision."
         ),
         methods_text=(
             "Raw Cell Painting exports often contain separate Image, Cell, Cytoplasm, Nuclei and metadata files. "
             "CPATK does not assume that ObjectNumber is comparable across compartments. Object-level tables are therefore summarised "
-            "within each ImageNumber using the requested statistic, then merged to the image/profile backbone."
+            "within each image/profile key using the requested statistic, then merged to the image/profile backbone. When object tables "
+            "lack Metadata_Plate or Metadata_Well but the Image table provides a unique ImageNumber mapping, those keys are propagated first."
         ),
         warnings=warnings,
     )

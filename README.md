@@ -648,3 +648,10 @@ The malaria and mitotox stress-test shells now run query-vs-control explanations
 CPATK v0.2.18 is a review pass over the larger v0.2.17 reporting and CLIPn update. It does not change the intended biological workflow. It clarifies that CLIPn can accept real zero values, and that CPATK only removes all-zero rows/features as an empty-signal QC step. Missing, NA, NaN and non-finite values remain the values that must be cleaned before CLIPn. The fast malaria and mitotox stress-test shells no longer pass the deprecated `--clipn_zero_epsilon` argument, to avoid implying that zeros are epsilon-replaced.
 
 The query-vs-background explanation summary now records whether query-vs-control SHAP was requested and which background column/values were used. Logging setup was also tightened so repeated CLI calls in the same Python process close old file handlers cleanly.
+
+
+### v0.2.20 profile-building key propagation
+
+CPATK v0.2.20 hardens raw CellProfiler profile building for multi-plate exports where the Image table contains assay keys such as `Metadata_Plate` and `Metadata_Well`, but object tables contain only `ImageNumber` and `ObjectNumber`. Before object aggregation, CPATK now propagates missing image-level assay keys onto object tables when the Image table provides a unique `ImageNumber` mapping. This allows explicit composite merge keys such as `Metadata_Plate,ImageNumber` without requiring every raw object table to already carry the plate column.
+
+If `ImageNumber` maps to more than one plate/well value and the object table lacks the disambiguating key, CPATK refuses to guess. Review `object_key_propagation_report.tsv`, `object_aggregation_report.tsv` and `metadata_merge_report.tsv` after profile building.

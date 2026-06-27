@@ -62,7 +62,7 @@ def calculate_batch_centroid_distances(
     return pd.DataFrame.from_records(records)
 
 
-def test_metadata_association_with_pcs(
+def calculate_metadata_association_with_pcs(
     *,
     features: pd.DataFrame,
     metadata: pd.DataFrame,

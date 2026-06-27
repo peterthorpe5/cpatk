@@ -10,7 +10,7 @@
 ##$ -adds l_hard gpu 1
 ##$ -adds l_hard cuda.0.name 'NVIDIA A40'
 
-# CPATK v0.2.18 fast malaria Cell Painting test workflow.
+# CPATK v0.2.19 fast malaria Cell Painting test workflow.
 #
 # This script is deliberately staged, resumable and conservative. It tests:
 #   1. metadata validation with explicit destination assay well columns
@@ -43,7 +43,7 @@ CLEANED_METADATA="${CLEANED_METADATA:-${BASE_DIR}/ML-BE009-kvp_cleaned.csv}"
 PHENOTYPE_LABEL_TABLE="${PHENOTYPE_LABEL_TABLE:-${BASE_DIR}/cpd_id_to_phenotype.tsv}"
 
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-PROJECT_OUT_DIR="${PROJECT_OUT_DIR:-${OUT_DIR:-${BASE_DIR}/cpatk_v0_2_18_malaria_fast_${RUN_TAG}}}"
+PROJECT_OUT_DIR="${PROJECT_OUT_DIR:-${OUT_DIR:-${BASE_DIR}/cpatk_v0_2_19_malaria_fast_${RUN_TAG}}}"
 
 # Fast filesystem mode. Heavy intermediate work is performed in job-local
 # scratch when TMPDIR is available, then copied back to PROJECT_OUT_DIR.
@@ -88,6 +88,7 @@ RUN_ML="${RUN_ML:-1}"
 RUN_EXPLAIN="${RUN_EXPLAIN:-1}"
 RUN_CLIPN="${RUN_CLIPN:-1}"
 RUN_CLIPN_LATENT_MOA="${RUN_CLIPN_LATENT_MOA:-1}"
+RUN_PCA_FALLBACK_LATENT_MOA="${RUN_PCA_FALLBACK_LATENT_MOA:-0}"
 RUN_FINAL_REPORT="${RUN_FINAL_REPORT:-1}"
 
 # CLIPn requires at least two datasets. This workflow supplies one preprocessed
@@ -148,7 +149,7 @@ COMPOUNDS=(
 ############################################
 
 # To activate a conda environment before running:
-#   CONDA_ENV_NAME=cpatk qsub run_malaria_cpatk_v0_2_18_fast_full_test.sh
+#   CONDA_ENV_NAME=cpatk qsub run_malaria_cpatk_v0_2_19_fast_full_test.sh
 if [[ -n "${CONDA_ENV_NAME:-}" ]]; then
   if [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
     # shellcheck source=/dev/null
@@ -169,7 +170,7 @@ if [[ -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
 fi
 
 # To install CPATK from a checked-out source folder before running:
-#   CPATK_SOURCE_DIR=/path/to/cpatk_v0_2_18_fast_full qsub run_malaria_cpatk_v0_2_18_fast_full_test.sh
+#   CPATK_SOURCE_DIR=/path/to/cpatk_v0_2_19_fast_full qsub run_malaria_cpatk_v0_2_19_fast_full_test.sh
 if [[ -n "${CPATK_SOURCE_DIR:-}" ]]; then
   python -m pip install -e "${CPATK_SOURCE_DIR}"
 fi
@@ -257,7 +258,7 @@ require_command() {
   local command_name="$1"
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "ERROR: command not found: ${command_name}" >&2
-    echo "Install/activate CPATK v0.2.18, or set CPATK_SOURCE_DIR to the source folder." >&2
+    echo "Install/activate CPATK v0.2.19, or set CPATK_SOURCE_DIR to the source folder." >&2
     exit 1
   fi
 }
@@ -451,6 +452,7 @@ fallback_image_merge_keys	${FALLBACK_IMAGE_MERGE_KEYS}
 clipn_strict_drop_any_zero	${CLIPN_STRICT_DROP_ANY_ZERO}
 clipn_zero_policy	${CLIPN_ZERO_POLICY}
 run_clipn_latent_moa	${RUN_CLIPN_LATENT_MOA}
+run_pca_fallback_latent_moa	${RUN_PCA_FALLBACK_LATENT_MOA}
 phenotype_label_table	${PHENOTYPE_LABEL_TABLE}
 use_phenotype_labels_for_moa	${USE_PHENOTYPE_LABELS_FOR_MOA}
 EOF
@@ -830,7 +832,7 @@ if [[ "${RUN_CLIPN}" == "1" ]]; then
     cpatk-clipn \
       --dataset "malaria=${PRIMARY_TABLE}" \
       --output_dir "${OUT_DIR}/12_clipn" \
-      --experiment malaria_cpatk_v0_2_18_fast \
+      --experiment malaria_cpatk_v0_2_19_fast \
       --mode integrate_all \
       --split_single_dataset_by_column Metadata_Compound \
       --single_dataset_split_names reference_like,query_like \
@@ -851,8 +853,18 @@ fi
 
 if [[ "${RUN_CLIPN_LATENT_MOA}" == "1" ]] && command -v cpatk-moa >/dev/null 2>&1; then
   CLIPN_LATENT_TABLE="${OUT_DIR}/12_clipn/clipn_latent.tsv.gz"
-  if [[ -s "${CLIPN_LATENT_TABLE}" ]]; then
-    section "Step 06b: CLIPn latent-space pseudo-anchor MOA analysis"
+  CLIPN_RUN_STATUS="${OUT_DIR}/12_clipn/clipn_run_status.tsv"
+  CLIPN_BACKEND_RUN="unknown"
+  if [[ -s "${CLIPN_RUN_STATUS}" ]]; then
+    CLIPN_BACKEND_RUN="$(awk -F '\t' 'NR == 2 {print $1}' "${CLIPN_RUN_STATUS}")"
+  fi
+  if [[ -s "${CLIPN_LATENT_TABLE}" && ( "${CLIPN_BACKEND_RUN}" == "success" || "${RUN_PCA_FALLBACK_LATENT_MOA}" == "1" ) ]]; then
+    if [[ "${CLIPN_BACKEND_RUN}" == "success" ]]; then
+      section "Step 06b: CLIPn latent-space pseudo-anchor MOA analysis"
+    else
+      section "Step 06b: PCA-fallback latent-space pseudo-anchor MOA analysis"
+      echo "WARN: CLIPn backend did not complete successfully (${CLIPN_BACKEND_RUN}); running latent-space MOA on PCA fallback because RUN_PCA_FALLBACK_LATENT_MOA=1." >&2
+    fi
   CLIPN_MOA_LABEL_ARGS=()
   if [[ "${USE_PHENOTYPE_LABELS_FOR_MOA:-0}" == "1" && -s "${PHENOTYPE_LABEL_TABLE:-}" ]]; then
     CLIPN_MOA_LABEL_ARGS=(
@@ -884,7 +896,11 @@ if [[ "${RUN_CLIPN_LATENT_MOA}" == "1" ]] && command -v cpatk-moa >/dev/null 2>&
         "${CLIPN_MOA_LABEL_ARGS[@]}" \
         --log_level "${LOG_LEVEL}"
   else
-    echo "WARN: RUN_CLIPN_LATENT_MOA=1 but no CLIPn latent table found: ${CLIPN_LATENT_TABLE}" >&2
+    if [[ ! -s "${CLIPN_LATENT_TABLE}" ]]; then
+      echo "WARN: RUN_CLIPN_LATENT_MOA=1 but no latent table found: ${CLIPN_LATENT_TABLE}" >&2
+    else
+      echo "WARN: RUN_CLIPN_LATENT_MOA=1 but CLIPn backend_run=${CLIPN_BACKEND_RUN}; skipping latent-space MOA. Set RUN_PCA_FALLBACK_LATENT_MOA=1 to run this on PCA fallback output." >&2
+    fi
   fi
 fi
 
@@ -895,9 +911,9 @@ fi
 if [[ "${RUN_FINAL_REPORT}" == "1" ]]; then
   section "Step 07: final HTML report index"
   REPORT_ARGS=(
-    --output_html "${OUT_DIR}/CPATK_malaria_v0_2_18_fast_full_report.html"
-    --title "CPATK v0.2.18 malaria Cell Painting validation report"
-    --narrative "End-to-end CPATK v0.2.18 validation on ML-BE009 malaria Cell Painting data. Review metadata merge rates, drift QC, preprocessing strategy comparison, reference-control QC, replicate QC, batch QC, classical plots, neighbour tables, MOA-style pseudo-anchors, CLIPn status and optional ML/explainability outputs before interpreting biology."
+    --output_html "${OUT_DIR}/CPATK_malaria_v0_2_19_fast_full_report.html"
+    --title "CPATK v0.2.19 malaria Cell Painting validation report"
+    --narrative "End-to-end CPATK v0.2.19 validation on ML-BE009 malaria Cell Painting data. Review metadata merge rates, drift QC, preprocessing strategy comparison, reference-control QC, replicate QC, batch QC, classical plots, neighbour tables, MOA-style pseudo-anchors, CLIPn status and optional ML/explainability outputs before interpreting biology."
     --warning "This is a validation workflow. Do not choose a normalisation strategy automatically; compare DMSO/reference QC, replicate consistency and batch association across strategies."
     --warning "The ML section uses compound IDs as labels for a software smoke test unless a genuine MOA label column is supplied."
     --warning "CLIPn latent-space MOA is reported separately when available. It is useful as a secondary view but does not replace the feature-space MOA analysis."
@@ -917,7 +933,7 @@ if [[ "${RUN_FINAL_REPORT}" == "1" ]]; then
   add_table_if_present "CLIPn run status" "${OUT_DIR}/12_clipn/clipn_run_status.tsv"
   add_table_if_present "CLIPn preprocessing summary" "${OUT_DIR}/12_clipn/clipn_preprocessing_summary.tsv"
   add_table_if_present "CLIPn latent diagnostic summary" "${OUT_DIR}/12_clipn/latent_diagnostic_summary.tsv"
-  add_table_if_present "CLIPn latent-space MOA predictions" "${OUT_DIR}/13_clipn_latent_moa/advanced_moa_top_predictions.tsv"
+  add_table_if_present "Latent-space MOA predictions" "${OUT_DIR}/13_clipn_latent_moa/advanced_moa_top_predictions.tsv"
   run_soft "cpatk-report" "${REPORT_ARGS[@]}"
 fi
 if [[ "${USE_LOCAL_SCRATCH}" == "1" ]]; then
@@ -930,4 +946,4 @@ section "Workflow complete"
 echo "Scratch output directory: ${OUT_DIR}"
 echo "Project output directory: ${PROJECT_OUT_DIR}"
 echo "Primary preprocessed table: ${PRIMARY_TABLE}"
-echo "Primary report on project filesystem: ${PROJECT_OUT_DIR}/CPATK_malaria_v0_2_18_fast_full_report.html"
+echo "Primary report on project filesystem: ${PROJECT_OUT_DIR}/CPATK_malaria_v0_2_19_fast_full_report.html"

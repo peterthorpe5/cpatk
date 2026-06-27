@@ -12,7 +12,7 @@ import pandas as pd
 from cpatk.batch import (
     calculate_batch_centroid_distances,
     cross_validated_batch_prediction,
-    test_metadata_association_with_pcs,
+    calculate_metadata_association_with_pcs,
 )
 from cpatk.clipn_adapter import (
     ClipnAdapterConfig,
@@ -194,7 +194,7 @@ class CpatkV02Tests(unittest.TestCase):
         self.assertEqual(distances["batch_1"].nunique(), 2)
 
     def test_pc_metadata_association(self) -> None:
-        association = test_metadata_association_with_pcs(
+        association = calculate_metadata_association_with_pcs(
             features=self.features,
             metadata=self.metadata,
             columns_to_test=["batch", "moa"],

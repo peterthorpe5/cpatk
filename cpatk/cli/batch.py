@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from cpatk.batch import calculate_batch_centroid_distances, cross_validated_batch_prediction, test_metadata_association_with_pcs
+from cpatk.batch import calculate_batch_centroid_distances, cross_validated_batch_prediction, calculate_metadata_association_with_pcs
 from cpatk.features import parse_column_list, split_metadata_and_features
 from cpatk.io import read_table, write_excel_workbook, write_table
 from cpatk.logging_utils import configure_logging
@@ -50,7 +50,7 @@ def main() -> None:
         logger=logger,
     )
     columns_to_test = parse_column_list(value=args.columns_to_test) or [args.batch_column]
-    pc_association = test_metadata_association_with_pcs(
+    pc_association = calculate_metadata_association_with_pcs(
         features=features,
         metadata=metadata,
         columns_to_test=columns_to_test,
