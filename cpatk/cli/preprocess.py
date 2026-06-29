@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -36,6 +36,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--metadata_columns", default=None)
     parser.add_argument("--feature_columns", default=None)
+    parser.add_argument(
+        "--protected_features",
+        default=None,
+        help="Comma-separated feature names to protect from ordinary feature filters when they are present, numeric and not entirely missing.",
+    )
+    parser.add_argument(
+        "--protected_features_file",
+        default=None,
+        help="Optional text file with one feature name per line to protect from ordinary feature filters. Blank lines and lines beginning with # are ignored.",
+    )
     parser.add_argument("--additional_metadata_columns", default=None)
     parser.add_argument("--aggregate_by", default=None)
     parser.add_argument("--image_table", default=None, help="When --input_dir is used, optional explicit Image/profile backbone table path.")
@@ -112,6 +122,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scaling_method", default="robust", choices=["robust", "standard", "minmax", "none"])
     parser.add_argument("--max_feature_missing_fraction", type=float, default=0.2)
     parser.add_argument("--max_sample_missing_fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--min_feature_variance",
+        type=float,
+        default=1e-12,
+        help="Minimum feature variance before imputation/scaling. Protected usable features can be rescued from this ordinary filter.",
+    )
     parser.add_argument("--max_absolute_correlation", type=float, default=0.95)
     parser.add_argument(
         "--correlation_method",
@@ -141,6 +157,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable_html_report", action="store_true")
     parser.add_argument("--log_level", default="INFO")
     return parser
+
+
+
+
+def _load_protected_features(
+    *,
+    inline_features: Optional[str],
+    feature_file: Optional[str],
+) -> List[str]:
+    """Load protected feature names from comma-separated text and/or a file."""
+    features: List[str] = []
+    inline = parse_column_list(value=inline_features) or []
+    features.extend(inline)
+    if feature_file:
+        path = Path(feature_file)
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            features.append(stripped)
+    seen = set()
+    output: List[str] = []
+    for feature in features:
+        name = str(feature).strip()
+        if name and name not in seen:
+            output.append(name)
+            seen.add(name)
+    return output
 
 
 def _write_result_tables(*, result: Dict[str, pd.DataFrame], output_dir: Path, logger) -> None:
@@ -270,6 +314,11 @@ def _write_html_report(
         output_path=report_path,
         summary_tables={
             "Preprocessing summary": result["preprocessing_summary"],
+            "Feature selection summary": result.get("feature_selection_summary", pd.DataFrame()),
+            "Feature selection report": result.get("feature_selection_report", pd.DataFrame()).head(5000),
+            "Protected feature audit": result.get("protected_feature_audit", pd.DataFrame()),
+            "Correlation filter report": result.get("correlation_filter_report", pd.DataFrame()).head(5000),
+            "Retained features": result.get("retained_features", pd.DataFrame()).head(5000),
             "Feature QC": result["feature_qc"],
             "Sample QC before feature QC": result.get("sample_qc_before_feature_qc", pd.DataFrame()),
             "Sample QC after feature QC": result.get("sample_qc_after_feature_qc", result["sample_qc"]),
@@ -343,6 +392,12 @@ def main() -> None:
     batch_protect_columns = parse_column_list(value=args.batch_protect_columns)
     replicate_group_columns = parse_column_list(value=args.replicate_group_columns)
     batch_report_columns = parse_column_list(value=args.batch_report_columns)
+    protected_features = _load_protected_features(
+        inline_features=args.protected_features,
+        feature_file=args.protected_features_file,
+    )
+    if protected_features:
+        logger.info("Loaded %d protected feature names.", len(protected_features))
 
     if args.aggregate_by:
         group_columns = parse_column_list(value=args.aggregate_by)
@@ -367,9 +422,13 @@ def main() -> None:
         additional_metadata_columns=additional_metadata_columns,
         max_feature_missing_fraction=args.max_feature_missing_fraction,
         max_sample_missing_fraction=args.max_sample_missing_fraction,
+        min_feature_variance=args.min_feature_variance,
         remove_correlated=not args.disable_correlation_filter,
         max_absolute_correlation=args.max_absolute_correlation,
         max_features_for_correlation=args.max_features_for_correlation,
+        correlation_method=args.correlation_method,
+        correlation_filter_strategy=args.correlation_filter_strategy,
+        protected_features=protected_features,
         max_zero_fraction=args.max_zero_fraction,
         remove_all_zero_rows=not args.disable_all_zero_row_filter,
         all_zero_row_tolerance=args.all_zero_row_tolerance,

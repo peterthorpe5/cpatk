@@ -10,7 +10,7 @@
 ##$ -adds l_hard gpu 1
 ##$ -adds l_hard cuda.0.name 'NVIDIA A40'
 
-# CPATK v0.2.22 fast malaria Cell Painting test workflow.
+# CPATK v0.2.23 fast malaria Cell Painting test workflow.
 #
 # This script is deliberately staged, resumable and conservative. It tests:
 #   1. metadata validation with explicit destination assay well columns
@@ -43,7 +43,7 @@ CLEANED_METADATA="${CLEANED_METADATA:-${BASE_DIR}/ML-BE009-kvp_cleaned.csv}"
 PHENOTYPE_LABEL_TABLE="${PHENOTYPE_LABEL_TABLE:-${BASE_DIR}/cpd_id_to_phenotype.tsv}"
 
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-PROJECT_OUT_DIR="${PROJECT_OUT_DIR:-${OUT_DIR:-${BASE_DIR}/cpatk_v0_2_22_malaria_fast_${RUN_TAG}}}"
+PROJECT_OUT_DIR="${PROJECT_OUT_DIR:-${OUT_DIR:-${BASE_DIR}/cpatk_v0_2_23_malaria_fast_${RUN_TAG}}}"
 
 # Fast filesystem mode. Heavy intermediate work is performed in job-local
 # scratch when TMPDIR is available, then copied back to PROJECT_OUT_DIR.
@@ -97,9 +97,19 @@ RUN_FINAL_REPORT="${RUN_FINAL_REPORT:-1}"
 # earlier CLIPn experiments could not tolerate zero values.
 CLIPN_LATENT_DIM="${CLIPN_LATENT_DIM:-10}"
 CLIPN_EPOCHS="${CLIPN_EPOCHS:-80}"
+CLIPN_EARLY_STOPPING="${CLIPN_EARLY_STOPPING:-1}"
+CLIPN_PATIENCE="${CLIPN_PATIENCE:-20}"
+CLIPN_MIN_DELTA="${CLIPN_MIN_DELTA:-0.0001}"
+CLIPN_EPOCH_CHUNK_SIZE="${CLIPN_EPOCH_CHUNK_SIZE:-10}"
+CLIPN_VALIDATION_FRACTION="${CLIPN_VALIDATION_FRACTION:-0.0}"
 CLIPN_STRICT_DROP_ANY_ZERO="${CLIPN_STRICT_DROP_ANY_ZERO:-0}"
 CLIPN_ZERO_POLICY="${CLIPN_ZERO_POLICY:-keep}"
 CLIPN_ALLOW_PCA_FALLBACK="${CLIPN_ALLOW_PCA_FALLBACK:-1}"
+
+# Optional user-requested features to keep through ordinary feature filters.
+# These are still audited and cannot rescue absent, non-numeric or all-missing features.
+PROTECTED_FEATURES="${PROTECTED_FEATURES:-}"
+PROTECTED_FEATURES_FILE="${PROTECTED_FEATURES_FILE:-}"
 
 # Lightweight settings for a first validation run. Increase for final analyses.
 N_CLUSTERS="${N_CLUSTERS:-8}"
@@ -149,7 +159,7 @@ COMPOUNDS=(
 ############################################
 
 # To activate a conda environment before running:
-#   CONDA_ENV_NAME=cpatk qsub run_malaria_cpatk_v0_2_22_fast_full_test.sh
+#   CONDA_ENV_NAME=cpatk qsub run_malaria_cpatk_v0_2_23_fast_full_test.sh
 if [[ -n "${CONDA_ENV_NAME:-}" ]]; then
   if [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
     # shellcheck source=/dev/null
@@ -170,7 +180,7 @@ if [[ -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
 fi
 
 # To install CPATK from a checked-out source folder before running:
-#   CPATK_SOURCE_DIR=/path/to/cpatk_v0_2_22_fast_full qsub run_malaria_cpatk_v0_2_22_fast_full_test.sh
+#   CPATK_SOURCE_DIR=/path/to/cpatk_v0_2_23_fast_full qsub run_malaria_cpatk_v0_2_23_fast_full_test.sh
 if [[ -n "${CPATK_SOURCE_DIR:-}" ]]; then
   python -m pip install -e "${CPATK_SOURCE_DIR}"
 fi
@@ -258,7 +268,7 @@ require_command() {
   local command_name="$1"
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "ERROR: command not found: ${command_name}" >&2
-    echo "Install/activate CPATK v0.2.22, or set CPATK_SOURCE_DIR to the source folder." >&2
+    echo "Install/activate CPATK v0.2.23, or set CPATK_SOURCE_DIR to the source folder." >&2
     exit 1
   fi
 }
@@ -600,6 +610,13 @@ run_preprocess_strategy() {
     echo "Skipping completed preprocessing strategy: ${strategy_name}"
     return 0
   fi
+  local protected_feature_args=()
+  if [[ -n "${PROTECTED_FEATURES}" ]]; then
+    protected_feature_args+=(--protected_features "${PROTECTED_FEATURES}")
+  fi
+  if [[ -n "${PROTECTED_FEATURES_FILE}" ]]; then
+    protected_feature_args+=(--protected_features_file "${PROTECTED_FEATURES_FILE}")
+  fi
   run cpatk-preprocess \
     --input_table "${PROFILE_TABLE}" \
     --output_dir "${strategy_dir}" \
@@ -616,6 +633,7 @@ run_preprocess_strategy() {
     --max_zero_fraction 1.0 \
     --replicate_group_columns "${REPLICATE_GROUP_COLUMNS}" \
     --batch_report_columns "${BATCH_REPORT_COLUMNS}" \
+    "${protected_feature_args[@]}" \
     "${extra_args[@]}" \
     --log_level "${LOG_LEVEL}"
   date > "${strategy_dir}/.preprocess.done"
@@ -831,11 +849,20 @@ if [[ "${RUN_CLIPN}" == "1" ]]; then
   if [[ "${CLIPN_ALLOW_PCA_FALLBACK}" == "1" ]]; then
     CLIPN_FALLBACK_ARGS+=(--allow_pca_fallback)
   fi
+  CLIPN_TRAINING_ARGS=(
+    --clipn_patience "${CLIPN_PATIENCE}"
+    --clipn_min_delta "${CLIPN_MIN_DELTA}"
+    --clipn_epoch_chunk_size "${CLIPN_EPOCH_CHUNK_SIZE}"
+    --clipn_validation_fraction "${CLIPN_VALIDATION_FRACTION}"
+  )
+  if [[ "${CLIPN_EARLY_STOPPING}" == "1" ]]; then
+    CLIPN_TRAINING_ARGS+=(--clipn_early_stopping)
+  fi
   run_soft_step "${OUT_DIR}/12_clipn/.clipn.done" \
     cpatk-clipn \
       --dataset "malaria=${PRIMARY_TABLE}" \
       --output_dir "${OUT_DIR}/12_clipn" \
-      --experiment malaria_cpatk_v0_2_22_fast \
+      --experiment malaria_cpatk_v0_2_23_fast \
       --mode integrate_all \
       --split_single_dataset_by_column Metadata_Compound \
       --single_dataset_split_names reference_like,query_like \
@@ -845,6 +872,7 @@ if [[ "${RUN_CLIPN}" == "1" ]]; then
       --metadata_columns "${METADATA_COLUMNS}" \
       --latent_dim "${CLIPN_LATENT_DIM}" \
       --epochs "${CLIPN_EPOCHS}" \
+      "${CLIPN_TRAINING_ARGS[@]}" \
       --imputation_method median \
       --scaling_method robust \
       --n_neighbours "${N_NEIGHBOURS}" \
@@ -914,9 +942,9 @@ fi
 if [[ "${RUN_FINAL_REPORT}" == "1" ]]; then
   section "Step 07: final HTML report index"
   REPORT_ARGS=(
-    --output_html "${OUT_DIR}/CPATK_malaria_v0_2_22_fast_full_report.html"
-    --title "CPATK v0.2.22 malaria Cell Painting validation report"
-    --narrative "End-to-end CPATK v0.2.22 validation on ML-BE009 malaria Cell Painting data. Review metadata merge rates, drift QC, preprocessing strategy comparison, reference-control QC, replicate QC, batch QC, classical plots, neighbour tables, MOA-style pseudo-anchors, CLIPn status and optional ML/explainability outputs before interpreting biology."
+    --output_html "${OUT_DIR}/CPATK_malaria_v0_2_23_fast_full_report.html"
+    --title "CPATK v0.2.23 malaria Cell Painting validation report"
+    --narrative "End-to-end CPATK v0.2.23 validation on ML-BE009 malaria Cell Painting data. Review metadata merge rates, drift QC, preprocessing strategy comparison, reference-control QC, replicate QC, batch QC, classical plots, neighbour tables, MOA-style pseudo-anchors, CLIPn status and optional ML/explainability outputs before interpreting biology."
     --warning "This is a validation workflow. Do not choose a normalisation strategy automatically; compare DMSO/reference QC, replicate consistency and batch association across strategies."
     --warning "The ML section uses compound IDs as labels for a software smoke test unless a genuine MOA label column is supplied."
     --warning "CLIPn latent-space MOA is reported separately when available. It is useful as a secondary view but does not replace the feature-space MOA analysis."
@@ -955,4 +983,4 @@ section "Workflow complete"
 echo "Scratch output directory: ${OUT_DIR}"
 echo "Project output directory: ${PROJECT_OUT_DIR}"
 echo "Primary preprocessed table: ${PRIMARY_TABLE}"
-echo "Primary report on project filesystem: ${PROJECT_OUT_DIR}/CPATK_malaria_v0_2_22_fast_full_report.html"
+echo "Primary report on project filesystem: ${PROJECT_OUT_DIR}/CPATK_malaria_v0_2_23_fast_full_report.html"

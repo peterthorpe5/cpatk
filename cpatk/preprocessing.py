@@ -971,12 +971,162 @@ def scale_features(
     return pd.DataFrame(data=values, columns=features.columns, index=features.index)
 
 
+
+
+def normalise_protected_feature_names(
+    *,
+    protected_features: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Return de-duplicated protected feature names, preserving input order."""
+    seen = set()
+    output: List[str] = []
+    for feature in protected_features or []:
+        name = str(feature).strip()
+        if not name or name.startswith("#"):
+            continue
+        if name not in seen:
+            output.append(name)
+            seen.add(name)
+    return output
+
+
+def build_protected_feature_audit(
+    *,
+    requested_features: Optional[Sequence[str]],
+    all_feature_columns: Sequence[str],
+    features: pd.DataFrame,
+    feature_qc: Optional[pd.DataFrame] = None,
+    final_features: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Audit requested protected features against input and final matrices.
+
+    Protected features are spared from ordinary feature-selection filters when
+    they are present and numeric, but they are not rescued if they are absent,
+    non-numeric or entirely missing.
+    """
+    requested = normalise_protected_feature_names(protected_features=requested_features)
+    all_feature_set = set(map(str, all_feature_columns))
+    final_set = set(map(str, final_features or []))
+    qc_by_feature = {}
+    if feature_qc is not None and not feature_qc.empty and "feature" in feature_qc.columns:
+        qc_by_feature = {str(row["feature"]): row for _, row in feature_qc.iterrows()}
+    records = []
+    for feature in requested:
+        present = feature in all_feature_set or feature in features.columns
+        numeric = bool(present and feature in features.columns and pd.api.types.is_numeric_dtype(features[feature]))
+        n_missing = np.nan
+        missing_fraction = np.nan
+        all_missing = False
+        if numeric:
+            values = pd.to_numeric(features[feature], errors="coerce")
+            n_missing = int(values.isna().sum())
+            missing_fraction = float(values.isna().mean())
+            all_missing = bool(values.notna().sum() == 0)
+        final_status = "protected_retained" if feature in final_set else "not_retained"
+        reason = "protected feature retained in final matrix" if feature in final_set else "not present in final feature matrix"
+        if not present:
+            final_status = "unavailable_absent"
+            reason = "requested feature was not present in the input feature set"
+        elif not numeric:
+            final_status = "unavailable_non_numeric"
+            reason = "requested feature was present but was not numeric"
+        elif all_missing:
+            final_status = "unavailable_all_missing"
+            reason = "requested feature was numeric but entirely missing"
+        qc_row = qc_by_feature.get(feature)
+        records.append(
+            {
+                "feature": feature,
+                "requested": True,
+                "present": bool(present),
+                "numeric": bool(numeric),
+                "all_missing": bool(all_missing),
+                "n_missing": n_missing,
+                "missing_fraction": missing_fraction,
+                "protected_from_feature_qc_filters": bool(numeric and not all_missing),
+                "protected_from_correlation_filter": bool(numeric and not all_missing),
+                "feature_qc_pass_without_protection": bool(qc_row.get("feature_qc_pass_without_protection", qc_row.get("feature_qc_pass", False))) if qc_row is not None else False,
+                "final_status": final_status,
+                "reason": reason,
+            }
+        )
+    return pd.DataFrame.from_records(records)
+
+
+def build_feature_selection_report(
+    *,
+    feature_qc: pd.DataFrame,
+    correlation_report: pd.DataFrame,
+    retained_features: Sequence[str],
+    protected_features: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Summarise why each feature was retained or removed."""
+    retained_set = set(map(str, retained_features))
+    protected_set = set(normalise_protected_feature_names(protected_features=protected_features))
+    corr_removed = {}
+    if correlation_report is not None and not correlation_report.empty:
+        removed_rows = correlation_report.loc[
+            correlation_report.get("status", pd.Series(dtype=str)).astype(str).eq("removed")
+        ]
+        for _, row in removed_rows.iterrows():
+            corr_removed[str(row.get("removed_feature", ""))] = row
+    records = []
+    for _, row in feature_qc.iterrows():
+        feature = str(row["feature"])
+        is_protected = feature in protected_set
+        status = "retained" if feature in retained_set else "removed"
+        reason = "retained in final feature matrix" if status == "retained" else "removed by feature QC"
+        if status == "retained" and is_protected and bool(row.get("rescued_by_protection", False)):
+            reason = "retained because requested protected feature was usable"
+        corr_row = corr_removed.get(feature)
+        if corr_row is not None:
+            reason = "removed by correlation filter"
+        elif status == "removed":
+            failed = []
+            for flag, label in [
+                ("pass_missingness", "missingness"),
+                ("pass_variance", "variance"),
+                ("pass_unique_values", "unique_values"),
+                ("pass_zero_fraction", "zero_fraction"),
+            ]:
+                if flag in row.index and not bool(row.get(flag)):
+                    failed.append(label)
+            reason = "removed by feature QC: " + ";".join(failed or ["unspecified"])
+        records.append(
+            {
+                "feature": feature,
+                "final_status": status,
+                "protected_feature": bool(is_protected),
+                "selection_reason": reason,
+                "missing_fraction": row.get("missing_fraction", np.nan),
+                "variance": row.get("variance", np.nan),
+                "n_unique": row.get("n_unique", np.nan),
+                "zero_fraction": row.get("zero_fraction", np.nan),
+                "pass_missingness": row.get("pass_missingness", np.nan),
+                "pass_variance": row.get("pass_variance", np.nan),
+                "pass_unique_values": row.get("pass_unique_values", np.nan),
+                "pass_zero_fraction": row.get("pass_zero_fraction", np.nan),
+                "feature_qc_pass": row.get("feature_qc_pass", np.nan),
+                "correlated_with_retained_feature": corr_row.get("retained_feature", "") if corr_row is not None else "",
+                "correlation": corr_row.get("correlation", np.nan) if corr_row is not None else np.nan,
+                "correlation_method": corr_row.get("correlation_method", "") if corr_row is not None else "",
+                "correlation_filter_strategy": corr_row.get("correlation_filter_strategy", "") if corr_row is not None else "",
+            }
+        )
+    report = pd.DataFrame.from_records(records)
+    if not report.empty:
+        order = {"retained": 0, "removed": 1}
+        report["_order"] = report["final_status"].map(order).fillna(2)
+        report = report.sort_values(["_order", "selection_reason", "feature"]).drop(columns=["_order"])
+    return report
+
 def _rank_features_for_correlation_filter(
     *,
     features: pd.DataFrame,
     correlation: pd.DataFrame,
     variances: pd.Series,
     strategy: str,
+    protected_features: Optional[Sequence[str]] = None,
 ) -> List[str]:
     """Rank features by the priority with which they should be retained.
 
@@ -987,16 +1137,20 @@ def _rank_features_for_correlation_filter(
     """
     strategy = strategy.lower()
     columns = list(features.columns)
+    protected = [feature for feature in normalise_protected_feature_names(protected_features=protected_features) if feature in columns]
+    protected_set = set(protected)
+    unprotected_columns = [feature for feature in columns if feature not in protected_set]
     if strategy == "table_order":
-        return columns
+        return protected + unprotected_columns
     if strategy == "min_redundancy":
-        mean_abs_correlation = correlation.copy()
+        mean_abs_correlation = correlation.loc[unprotected_columns, unprotected_columns].copy()
         if not mean_abs_correlation.empty:
             np.fill_diagonal(mean_abs_correlation.values, 0.0)
         score = mean_abs_correlation.mean(axis=0).fillna(0.0)
-        return list(score.sort_values(ascending=True, kind="mergesort").index)
+        return protected + list(score.sort_values(ascending=True, kind="mergesort").index)
     if strategy == "variance":
-        return list(variances.sort_values(ascending=False, kind="mergesort").index)
+        ranked_unprotected = list(variances.loc[unprotected_columns].sort_values(ascending=False, kind="mergesort").index)
+        return protected + ranked_unprotected
     raise ValueError(f"Unsupported correlation_filter_strategy: {strategy}")
 
 
@@ -1007,6 +1161,7 @@ def remove_correlated_features(
     max_features_for_correlation: int = 5000,
     correlation_method: str = "spearman",
     correlation_filter_strategy: str = "variance",
+    protected_features: Optional[Sequence[str]] = None,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Remove redundant highly correlated features.
@@ -1028,6 +1183,7 @@ def remove_correlated_features(
         "correlation_filter_strategy",
         "n_features",
         "max_features_for_correlation",
+        "protected_feature",
     ]
     method = correlation_method.lower()
     strategy = correlation_filter_strategy.lower()
@@ -1060,6 +1216,7 @@ def remove_correlated_features(
                     "correlation_filter_strategy": strategy,
                     "n_features": int(features.shape[1]),
                     "max_features_for_correlation": int(max_features_for_correlation),
+                    "protected_feature": False,
                 }
             ]
         )
@@ -1073,11 +1230,14 @@ def remove_correlated_features(
     correlation = numeric_features.corr(method=method).abs().fillna(0.0)
     variances = numeric_features.var(axis=0, skipna=True).fillna(0.0)
     missing = numeric_features.isna().mean(axis=0)
+    protected = [feature for feature in normalise_protected_feature_names(protected_features=protected_features) if feature in numeric_features.columns]
+    protected_set = set(protected)
     priority = _rank_features_for_correlation_filter(
         features=numeric_features,
         correlation=correlation,
         variances=variances,
         strategy=strategy,
+        protected_features=protected,
     )
     priority_rank = {feature: rank for rank, feature in enumerate(priority, start=1)}
     retained: List[str] = []
@@ -1086,6 +1246,9 @@ def remove_correlated_features(
 
     for candidate in priority:
         if candidate in removed:
+            continue
+        if candidate in protected_set:
+            retained.append(candidate)
             continue
         correlated_retained = [
             kept
@@ -1117,6 +1280,7 @@ def remove_correlated_features(
                 "retained_variance": float(variances[retained_feature]),
                 "removed_priority_rank": int(priority_rank[candidate]),
                 "retained_priority_rank": int(priority_rank[retained_feature]),
+                "protected_feature": False,
             }
         )
 
@@ -1285,6 +1449,7 @@ def preprocess_profiles(
     max_features_for_correlation: int = 5000,
     correlation_method: str = "spearman",
     correlation_filter_strategy: str = "variance",
+    protected_features: Optional[Sequence[str]] = None,
     imputation_method: str = "median",
     imputation_group_columns: Optional[Sequence[str]] = None,
     add_missing_indicators: bool = False,
@@ -1386,6 +1551,11 @@ def preprocess_profiles(
         n_values_replaced=int(nonfinite_report.get("n_total_values_replaced", nonfinite_report.get("n_nonfinite_replaced", pd.Series(dtype=int))).sum()) if not nonfinite_report.empty else 0,
     )
 
+    protected_feature_names = normalise_protected_feature_names(protected_features=protected_features)
+    available_protected_features = [
+        feature for feature in protected_feature_names
+        if feature in features.columns and pd.api.types.is_numeric_dtype(features[feature]) and features[feature].notna().any()
+    ]
     feature_qc = calculate_feature_qc(features=features)
     selected_features, feature_qc = select_features_by_qc(
         feature_qc=feature_qc,
@@ -1394,9 +1564,26 @@ def preprocess_profiles(
         min_unique_values=min_unique_values,
         max_zero_fraction=max_zero_fraction,
     )
+    feature_qc["feature_qc_pass_without_protection"] = feature_qc["feature_qc_pass"]
+    feature_qc["protected_feature"] = feature_qc["feature"].astype(str).isin(set(available_protected_features))
+    feature_qc["rescued_by_protection"] = False
+    protected_to_rescue = [feature for feature in available_protected_features if feature not in selected_features]
+    if protected_to_rescue:
+        selected_features = list(dict.fromkeys(selected_features + protected_to_rescue))
+        feature_qc.loc[feature_qc["feature"].isin(protected_to_rescue), "feature_qc_pass"] = True
+        feature_qc.loc[feature_qc["feature"].isin(protected_to_rescue), "rescued_by_protection"] = True
     if not selected_features:
         raise ValueError("No features passed preprocessing QC. Review metadata/feature columns or relax thresholds.")
-    _decision_log(decisions, "feature_qc", "Applied feature missingness/variance/uniqueness filters", n_retained=len(selected_features), n_input=len(feature_names))
+    _decision_log(
+        decisions,
+        "feature_qc",
+        "Applied feature missingness/variance/uniqueness filters, rescuing requested protected features when usable",
+        n_retained=len(selected_features),
+        n_input=len(feature_names),
+        n_protected_requested=len(protected_feature_names),
+        n_protected_available=len(available_protected_features),
+        n_protected_rescued=len(protected_to_rescue),
+    )
 
     selected_for_sample_qc = features.loc[:, selected_features]
     all_zero_row_report = calculate_all_zero_row_report(
@@ -1557,6 +1744,7 @@ def preprocess_profiles(
             max_features_for_correlation=max_features_for_correlation,
             correlation_method=correlation_method,
             correlation_filter_strategy=correlation_filter_strategy,
+            protected_features=available_protected_features,
             logger=logger,
         )
         n_removed_corr = int((correlation_report.get("status", pd.Series(dtype=str)) == "removed").sum())
@@ -1596,6 +1784,30 @@ def preprocess_profiles(
         }
     )
     feature_family_summary = summarise_feature_families(feature_names=final_features.columns.tolist())
+    protected_feature_audit = build_protected_feature_audit(
+        requested_features=protected_feature_names,
+        all_feature_columns=feature_names,
+        features=features,
+        feature_qc=feature_qc,
+        final_features=final_features.columns.tolist(),
+    )
+    feature_selection_report = build_feature_selection_report(
+        feature_qc=feature_qc,
+        correlation_report=correlation_report,
+        retained_features=final_features.columns.tolist(),
+        protected_features=protected_feature_names,
+    )
+    feature_selection_summary = pd.DataFrame.from_records(
+        [
+            {"stage": "input_numeric_features", "n_features": int(len(feature_names))},
+            {"stage": "after_feature_qc", "n_features": int(len(selected_features))},
+            {"stage": "after_correlation_filter", "n_features": int(len(final_features.columns))},
+            {"stage": "protected_features_requested", "n_features": int(len(protected_feature_names))},
+            {"stage": "protected_features_retained", "n_features": int(sum(feature in final_features.columns for feature in protected_feature_names))},
+            {"stage": "removed_by_feature_qc", "n_features": int((feature_selection_report["selection_reason"].astype(str).str.startswith("removed by feature QC")).sum()) if not feature_selection_report.empty else 0},
+            {"stage": "removed_by_correlation_filter", "n_features": int((feature_selection_report["selection_reason"] == "removed by correlation filter").sum()) if not feature_selection_report.empty else 0},
+        ]
+    )
 
     config = pd.DataFrame.from_records(
         [
@@ -1621,6 +1833,7 @@ def preprocess_profiles(
             {"parameter": "max_features_for_correlation", "value": str(max_features_for_correlation)},
             {"parameter": "include_qc_numeric_features", "value": str(include_qc_numeric_features)},
             {"parameter": "include_missing_indicators_in_correlation_filter", "value": str(include_missing_indicators_in_correlation_filter)},
+            {"parameter": "protected_features", "value": ";".join(protected_feature_names)},
         ]
     )
     summary = pd.DataFrame.from_records(
@@ -1639,6 +1852,9 @@ def preprocess_profiles(
             {"item": "n_missing_indicator_features_added", "value": int(indicators.shape[1])},
             {"item": "n_features_after_correlation_filter", "value": int(len(final_features.columns))},
             {"item": "n_correlated_features_removed", "value": int((correlation_report.get("status", pd.Series(dtype=str)) == "removed").sum())},
+            {"item": "n_protected_features_requested", "value": int(len(protected_feature_names))},
+            {"item": "n_protected_features_available", "value": int(len(available_protected_features))},
+            {"item": "n_protected_features_retained", "value": int(sum(feature in final_features.columns for feature in protected_feature_names))},
             {"item": "n_excluded_numeric_qc_or_provenance_columns", "value": int((column_role_report["role"] == "excluded_numeric_qc_or_provenance").sum())},
             {"item": "imputation_method", "value": imputation_method},
             {"item": "imputation_group_columns", "value": ";".join(imputation_group_columns or [])},
@@ -1684,6 +1900,9 @@ def preprocess_profiles(
         "correlation_filter_report": correlation_report,
         "final_matrix_validation": final_matrix_validation,
         "retained_features": retained_features,
+        "protected_feature_audit": protected_feature_audit,
+        "feature_selection_report": feature_selection_report,
+        "feature_selection_summary": feature_selection_summary,
         "feature_family_summary": feature_family_summary,
         "preprocessing_config": config,
         "preprocessing_decision_log": pd.DataFrame.from_records(decisions),

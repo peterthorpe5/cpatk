@@ -55,7 +55,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predict_method", default="predict")
     parser.add_argument("--latent_dim", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--epochs", type=int, default=300, help="Maximum CLIPn training epochs. Used as a hard cap when early stopping is enabled.")
+    parser.add_argument(
+        "--clipn_early_stopping",
+        action="store_true",
+        help="Train in chunks and stop when reported training loss has plateaued. This monitors training loss, not validation loss, because common CLIPn backends do not expose a validation callback.",
+    )
+    parser.add_argument("--clipn_patience", type=int, default=20, help="Reported loss rows without improvement before stopping when --clipn_early_stopping is enabled.")
+    parser.add_argument("--clipn_min_delta", type=float, default=1e-4, help="Minimum loss improvement required to reset CLIPn early-stopping patience.")
+    parser.add_argument("--clipn_epoch_chunk_size", type=int, default=10, help="Epochs per backend fit call when --clipn_early_stopping is enabled.")
+    parser.add_argument("--clipn_validation_fraction", type=float, default=0.0, help="Recorded for provenance. Current generic CLIPn backend uses training-loss monitoring because it lacks a validation hook.")
     parser.add_argument(
         "--imputation_method",
         choices=["none", "median", "mean", "knn"],
@@ -231,6 +240,11 @@ def main() -> None:
         latent_dim=args.latent_dim,
         learning_rate=args.lr,
         epochs=args.epochs,
+        early_stopping=args.clipn_early_stopping,
+        early_stopping_patience=args.clipn_patience,
+        early_stopping_min_delta=args.clipn_min_delta,
+        early_stopping_chunk_size=args.clipn_epoch_chunk_size,
+        validation_fraction=args.clipn_validation_fraction,
         imputation_method=args.imputation_method,
         imputation_group_columns=parse_column_list(value=args.imputation_group_columns)
         or ["Dataset", "Plate_Metadata"],

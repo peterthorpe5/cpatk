@@ -173,6 +173,11 @@ class ClipnAdapterConfig:
     latent_dim: int = 20
     learning_rate: float = 1e-5
     epochs: int = 300
+    early_stopping: bool = False
+    early_stopping_patience: int = 20
+    early_stopping_min_delta: float = 1e-4
+    early_stopping_chunk_size: int = 10
+    validation_fraction: float = 0.0
     imputation_method: str = "median"
     imputation_group_columns: list[str] = field(default_factory=lambda: ["Dataset", "Plate_Metadata"])
     max_feature_missing_fraction: float = 0.3
@@ -223,6 +228,7 @@ def collect_clipn_backend_provenance(
     backend_run: str = "not_run",
     pca_fallback_used: bool = False,
     loss_table: Optional[pd.DataFrame] = None,
+    training_summary: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Collect runtime provenance for a CLIPn adapter run.
 
@@ -262,6 +268,15 @@ def collect_clipn_backend_provenance(
             final_loss = float(losses.iloc[-1])
             min_loss = float(losses.min())
 
+    training_policy = "unknown"
+    stopping_reason = "unknown"
+    best_epoch: object = np.nan
+    if training_summary is not None and not training_summary.empty:
+        row = training_summary.iloc[0]
+        training_policy = str(row.get("training_policy", "unknown"))
+        stopping_reason = str(row.get("stopping_reason", "unknown"))
+        best_epoch = row.get("best_epoch", np.nan)
+
     return pd.DataFrame.from_records(
         [
             {
@@ -279,6 +294,9 @@ def collect_clipn_backend_provenance(
                 "training_loss_rows": n_loss_rows,
                 "final_training_loss": final_loss,
                 "minimum_training_loss": min_loss,
+                "training_policy": training_policy,
+                "stopping_reason": stopping_reason,
+                "best_epoch": best_epoch,
             }
         ]
     )
@@ -1015,6 +1033,127 @@ def _latent_to_table(
     return latent_table
 
 
+
+
+def _loss_to_float_list(loss: object) -> list[float]:
+    """Convert backend loss output to a list of floats when possible."""
+    if isinstance(loss, (list, tuple, np.ndarray, pd.Series)):
+        values = []
+        for value in list(loss):
+            try:
+                values.append(float(value))
+            except Exception:
+                continue
+        return values
+    if loss is None:
+        return []
+    try:
+        return [float(loss)]
+    except Exception:
+        return []
+
+
+def _fit_clipn_with_training_policy(
+    *,
+    model: object,
+    fit_method: str,
+    train_x: Mapping[int, np.ndarray],
+    train_y: Mapping[int, np.ndarray],
+    config: ClipnAdapterConfig,
+    logger: Optional[logging.Logger] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fit the backend using fixed epochs or conservative loss-plateau stopping.
+
+    Most CLIPn backends expose only a ``fit(X, y, lr, epochs)`` hook and do not
+    provide a validation callback. CPATK therefore uses fixed epochs by default.
+    If early stopping is enabled, it trains the same model in short chunks and
+    stops when the reported training loss has not improved by ``min_delta`` for
+    ``patience`` reported loss rows. This is not a validation-loss guarantee;
+    the report states that clearly.
+    """
+    fit = getattr(model, fit_method)
+    requested_epochs = int(max(config.epochs, 1))
+    records: list[dict] = []
+    summary = {
+        "training_policy": "fixed_epochs",
+        "requested_max_epochs": requested_epochs,
+        "early_stopping_enabled": bool(config.early_stopping),
+        "early_stopping_patience": int(config.early_stopping_patience),
+        "early_stopping_min_delta": float(config.early_stopping_min_delta),
+        "early_stopping_chunk_size": int(config.early_stopping_chunk_size),
+        "validation_fraction_requested": float(config.validation_fraction),
+        "validation_monitor_used": "none_backend_lacks_validation_hook",
+        "fit_calls": 0,
+        "reported_loss_rows": 0,
+        "best_epoch": np.nan,
+        "best_loss": np.nan,
+        "final_loss": np.nan,
+        "stopping_reason": "completed_fixed_epochs",
+    }
+    if not config.early_stopping:
+        loss = fit(train_x, train_y, lr=config.learning_rate, epochs=requested_epochs)
+        loss_values = _loss_to_float_list(loss)
+        records = [
+            {"epoch": int(index), "loss": float(value), "fit_call": 1}
+            for index, value in enumerate(loss_values, start=1)
+        ]
+        summary["fit_calls"] = 1
+    else:
+        summary["training_policy"] = "chunked_training_loss_early_stopping"
+        chunk_size = int(max(config.early_stopping_chunk_size, 1))
+        patience = int(max(config.early_stopping_patience, 1))
+        min_delta = float(max(config.early_stopping_min_delta, 0.0))
+        best_loss = math.inf
+        best_epoch: Optional[int] = None
+        rows_without_improvement = 0
+        fit_call = 0
+        reported_epoch = 0
+        epochs_requested_so_far = 0
+        while epochs_requested_so_far < requested_epochs:
+            remaining = requested_epochs - epochs_requested_so_far
+            this_chunk = int(min(chunk_size, remaining))
+            fit_call += 1
+            loss = fit(train_x, train_y, lr=config.learning_rate, epochs=this_chunk)
+            epochs_requested_so_far += this_chunk
+            loss_values = _loss_to_float_list(loss)
+            if not loss_values:
+                if logger is not None:
+                    logger.warning(
+                        "CLIPn backend returned no numeric loss values during fit call %d; continuing until max epochs.",
+                        fit_call,
+                    )
+                continue
+            for value in loss_values:
+                reported_epoch += 1
+                records.append({"epoch": reported_epoch, "loss": float(value), "fit_call": fit_call})
+                if np.isfinite(value) and (best_loss - float(value)) > min_delta:
+                    best_loss = float(value)
+                    best_epoch = reported_epoch
+                    rows_without_improvement = 0
+                else:
+                    rows_without_improvement += 1
+            if rows_without_improvement >= patience:
+                summary["stopping_reason"] = "early_stopping_training_loss_plateau"
+                break
+        summary["fit_calls"] = fit_call
+        if summary["stopping_reason"] != "early_stopping_training_loss_plateau":
+            summary["stopping_reason"] = "completed_max_epochs_before_patience"
+        if best_epoch is not None:
+            summary["best_epoch"] = int(best_epoch)
+            summary["best_loss"] = float(best_loss)
+    loss_table = pd.DataFrame.from_records(records, columns=["epoch", "loss", "fit_call"])
+    if not loss_table.empty and "loss" in loss_table.columns:
+        losses = pd.to_numeric(loss_table["loss"], errors="coerce").dropna()
+        summary["reported_loss_rows"] = int(loss_table.shape[0])
+        if not losses.empty:
+            summary["final_loss"] = float(losses.iloc[-1])
+            if not np.isfinite(float(summary["best_loss"])):
+                summary["best_loss"] = float(losses.min())
+                summary["best_epoch"] = int(losses.idxmin() + 1)
+    training_summary = pd.DataFrame.from_records([summary])
+    return loss_table, training_summary
+
+
 def fit_clipn_backend(
     *,
     cleaned: Mapping[str, pd.DataFrame],
@@ -1022,7 +1161,7 @@ def fit_clipn_backend(
     metadata: pd.DataFrame,
     config: ClipnAdapterConfig,
     logger: Optional[logging.Logger] = None,
-) -> tuple[pd.DataFrame, object, pd.DataFrame]:
+) -> tuple[pd.DataFrame, object, pd.DataFrame, pd.DataFrame]:
     """Fit/project a compatible CLIPn backend and return latent table."""
     model_class = _resolve_backend_class(config=config)
     reference_names = config.reference_names if config.mode == "reference_only" else None
@@ -1032,8 +1171,14 @@ def fit_clipn_backend(
         reference_names=reference_names,
     )
     model = model_class(train_x, train_y, latent_dim=config.latent_dim)
-    fit = getattr(model, config.fit_method)
-    loss = fit(train_x, train_y, lr=config.learning_rate, epochs=config.epochs)
+    loss_table, training_summary = _fit_clipn_with_training_policy(
+        model=model,
+        fit_method=config.fit_method,
+        train_x=train_x,
+        train_y=train_y,
+        config=config,
+        logger=logger,
+    )
     _safe_model_eval(model)
 
     all_x, _, all_mapping = _build_indexed_arrays(cleaned=cleaned, labels=labels)
@@ -1059,18 +1204,7 @@ def fit_clipn_backend(
         metadata=metadata,
         config=config,
     )
-    loss_values = []
-    if isinstance(loss, (list, tuple, np.ndarray)):
-        loss_values = [float(value) for value in list(loss)]
-    elif loss is not None:
-        try:
-            loss_values = [float(loss)]
-        except Exception:
-            loss_values = []
-    loss_table = pd.DataFrame(
-        {"epoch": np.arange(1, len(loss_values) + 1, dtype=int), "loss": loss_values}
-    )
-    return latent_table, model, loss_table
+    return latent_table, model, loss_table, training_summary
 
 
 def fit_pca_fallback(
@@ -1296,10 +1430,11 @@ def run_clipn_workflow(
     latent_table = pd.DataFrame()
     model: object | None = None
     loss_table = pd.DataFrame()
+    training_summary = pd.DataFrame()
     warnings = []
     if bool(status["available"].iloc[0]):
         try:
-            latent_table, model, loss_table = fit_clipn_backend(
+            latent_table, model, loss_table, training_summary = fit_clipn_backend(
                 cleaned=cleaned,
                 labels=labels,
                 metadata=metadata,
@@ -1325,6 +1460,16 @@ def run_clipn_workflow(
             [{"backend_run": "not_run", "message": message}]
         )
     output_tables["clipn_run_status"] = run_status
+    if training_summary.empty:
+        training_summary = pd.DataFrame.from_records([
+            {
+                "training_policy": "not_run",
+                "requested_max_epochs": int(config.epochs),
+                "early_stopping_enabled": bool(config.early_stopping),
+                "stopping_reason": str(run_status["backend_run"].iloc[0]) if "backend_run" in run_status.columns else "unknown",
+            }
+        ])
+    output_tables["clipn_training_summary"] = training_summary
     pca_fallback_used = False
     if latent_table.empty and config.allow_pca_fallback:
         latent_table, model, fallback_info = fit_pca_fallback(
@@ -1340,6 +1485,7 @@ def run_clipn_workflow(
         backend_run=str(run_status["backend_run"].iloc[0]) if "backend_run" in run_status.columns else "unknown",
         pca_fallback_used=pca_fallback_used,
         loss_table=loss_table,
+        training_summary=training_summary,
     )
     if not latent_table.empty:
         output_tables["clipn_latent"] = latent_table
@@ -1421,7 +1567,7 @@ def run_clipn_adapter(
             logger=logger,
         )
         labels, _, label_report = encode_labels_for_clipn(datasets=datasets, config=config)
-        latent, _, loss_table = fit_clipn_backend(
+        latent, _, loss_table, training_summary = fit_clipn_backend(
             cleaned=cleaned,
             labels=labels,
             metadata=metadata,
@@ -1435,6 +1581,7 @@ def run_clipn_adapter(
             "clipn_preprocessing_summary": preprocessing,
             "clipn_label_report": label_report,
             "clipn_training_loss": loss_table,
+            "clipn_training_summary": training_summary,
             "clipn_latent": latent,
         }
     except Exception as exc:
