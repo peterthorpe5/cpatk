@@ -114,6 +114,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_sample_missing_fraction", type=float, default=0.5)
     parser.add_argument("--max_absolute_correlation", type=float, default=0.95)
     parser.add_argument(
+        "--correlation_method",
+        default="spearman",
+        choices=["pearson", "spearman", "kendall"],
+        help="Correlation method for redundant-feature filtering. Default: spearman, which is usually safer for non-normal Cell Painting features.",
+    )
+    parser.add_argument(
+        "--correlation_filter_strategy",
+        default="variance",
+        choices=["variance", "min_redundancy", "table_order"],
+        help="Which feature to prioritise within highly correlated sets. Default: variance, retaining the highest-variance feature first.",
+    )
+    parser.add_argument(
         "--max_features_for_correlation",
         type=int,
         default=5000,
@@ -138,8 +150,13 @@ def _write_result_tables(*, result: Dict[str, pd.DataFrame], output_dir: Path, l
             try:
                 write_table(data_frame=table, path=output_dir / "preprocessed.parquet", logger=logger)
             except ImportError as exc:
-                logger.warning("Parquet writing unavailable; writing TSV.GZ fallback: %s", exc)
+                if logger is not None:
+                    logger.warning("Parquet writing unavailable; writing TSV.GZ fallback: %s", exc)
                 write_table(data_frame=table, path=output_dir / "preprocessed.tsv.gz", logger=logger)
+        elif name == "before_after_replicate_correlations":
+            if logger is not None:
+                logger.info("Writing large pairwise replicate table as compressed TSV.GZ: %s", name)
+            write_table(data_frame=table, path=output_dir / f"{name}.tsv.gz", logger=logger)
         else:
             write_table(data_frame=table, path=output_dir / f"{name}.tsv", logger=logger)
     write_excel_workbook(tables=result, path=output_dir / "preprocessing_summary.xlsx", logger=logger)

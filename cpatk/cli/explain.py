@@ -74,6 +74,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _normalise_label(value: object) -> str:
+    """Return a lower-case identifier for query/background comparisons."""
+    return str(value).strip().lower()
+
+
+def _query_matches_background(
+    *,
+    query_id: object,
+    metadata: pd.DataFrame,
+    id_column: str,
+    background_column: str,
+    background_values: list[str],
+) -> bool:
+    """Return whether a query is itself part of the configured background set."""
+    query_key = _normalise_label(query_id)
+    accepted = {_normalise_label(value) for value in background_values}
+    if query_key in accepted:
+        return True
+    if id_column not in metadata.columns or background_column not in metadata.columns:
+        return False
+    query_rows = metadata.loc[metadata[id_column].map(_normalise_label) == query_key]
+    if query_rows.empty:
+        return False
+    values = query_rows[background_column].dropna().map(_normalise_label).unique().tolist()
+    return bool(values) and all(value in accepted for value in values)
+
+
 def _run_global_attribution(
     *,
     features: pd.DataFrame,
@@ -178,7 +205,30 @@ def _run_query_neighbourhoods(
                 sep="\t",
                 index=False,
             )
-        if args.run_feature_tests:
+        query_is_background = _query_matches_background(
+            query_id=query_id,
+            metadata=metadata,
+            id_column=args.id_column,
+            background_column=args.background_column,
+            background_values=background_values,
+        )
+        if args.run_feature_tests and query_is_background:
+            status = pd.DataFrame.from_records(
+                [
+                    {
+                        "query_id": query_id,
+                        "status": "skipped_query_is_background",
+                        "message": "Query is itself part of the configured background/control set.",
+                    }
+                ]
+            )
+            write_table(
+                data_frame=status,
+                path=query_dir / "query_vs_background_feature_statistics_status.tsv",
+                logger=logger,
+            )
+            query_report_tables["Query vs background feature statistics status"] = status
+        elif args.run_feature_tests:
             try:
                 stats = calculate_query_background_statistics(
                     metadata=metadata,
@@ -217,7 +267,19 @@ def _run_query_neighbourhoods(
                     path=query_dir / "query_vs_background_feature_statistics_status.tsv",
                     logger=logger,
                 )
-        if args.run_query_background_shap:
+        if args.run_query_background_shap and query_is_background:
+            status = pd.DataFrame.from_records(
+                [
+                    {
+                        "query_id": query_id,
+                        "status": "skipped_query_is_background",
+                        "message": "Query is itself part of the configured background/control set.",
+                    }
+                ]
+            )
+            write_table(data_frame=status, path=query_dir / "query_vs_background_shap_status.tsv", logger=logger)
+            query_report_tables["Query vs background SHAP status"] = status
+        elif args.run_query_background_shap:
             try:
                 ids = metadata[args.id_column].map(lambda value: str(value).strip().lower())
                 query_key = str(query_id).strip().lower()
@@ -400,6 +462,7 @@ def _run_query_neighbourhoods(
                 "neighbourhood_shap_requested": bool(args.run_neighbourhood_shap),
                 "background_column": args.background_column,
                 "background_values": ",".join(background_values),
+                "query_is_background": bool(query_is_background),
             }
         )
     summary = pd.DataFrame.from_records(summary_records)

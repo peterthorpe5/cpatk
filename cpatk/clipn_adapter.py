@@ -21,7 +21,9 @@ import logging
 import math
 import os
 import pickle
+import platform
 import re
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -213,6 +215,73 @@ def check_clipn_backend(*, backend_module: str = "clipn") -> pd.DataFrame:
                 }
             ]
         )
+
+
+def collect_clipn_backend_provenance(
+    *,
+    backend_module: str,
+    backend_run: str = "not_run",
+    pca_fallback_used: bool = False,
+    loss_table: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Collect runtime provenance for a CLIPn adapter run.
+
+    The output is intentionally table-shaped so it can be written directly into
+    results folders and HTML reports.  It records enough information to tell
+    whether a latent space came from a real CLIPn backend run, a PCA fallback,
+    CPU execution or a CUDA-backed run.
+    """
+    torch_version = "not_imported"
+    torch_cuda_available: object = "not_imported"
+    torch_cuda_device_count: object = "not_imported"
+    torch_cuda_device_names = ""
+    try:
+        import torch  # type: ignore
+
+        torch_version = str(getattr(torch, "__version__", "unknown"))
+        torch_cuda_available = bool(torch.cuda.is_available())
+        torch_cuda_device_count = int(torch.cuda.device_count())
+        names = []
+        for index in range(int(torch_cuda_device_count)):
+            try:
+                names.append(str(torch.cuda.get_device_name(index)))
+            except Exception:
+                names.append(f"device_{index}_name_unavailable")
+        torch_cuda_device_names = ";".join(names)
+    except Exception as exc:
+        torch_version = f"import_failed: {exc}"
+        torch_cuda_available = "unknown"
+        torch_cuda_device_count = "unknown"
+
+    n_loss_rows = int(loss_table.shape[0]) if loss_table is not None and not loss_table.empty else 0
+    final_loss = float("nan")
+    min_loss = float("nan")
+    if loss_table is not None and not loss_table.empty and "loss" in loss_table.columns:
+        losses = pd.to_numeric(loss_table["loss"], errors="coerce").dropna()
+        if not losses.empty:
+            final_loss = float(losses.iloc[-1])
+            min_loss = float(losses.min())
+
+    return pd.DataFrame.from_records(
+        [
+            {
+                "backend_module": backend_module,
+                "backend_run": backend_run,
+                "pca_fallback_used": bool(pca_fallback_used),
+                "python_version": sys.version.replace("\n", " "),
+                "python_executable": sys.executable,
+                "platform": platform.platform(),
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                "torch_version": torch_version,
+                "torch_cuda_available": torch_cuda_available,
+                "torch_cuda_device_count": torch_cuda_device_count,
+                "torch_cuda_device_names": torch_cuda_device_names,
+                "training_loss_rows": n_loss_rows,
+                "final_training_loss": final_loss,
+                "minimum_training_loss": min_loss,
+            }
+        ]
+    )
 
 
 def save_clipn_config(*, config: ClipnAdapterConfig, path: Path) -> Path:
@@ -1256,14 +1325,22 @@ def run_clipn_workflow(
             [{"backend_run": "not_run", "message": message}]
         )
     output_tables["clipn_run_status"] = run_status
+    pca_fallback_used = False
     if latent_table.empty and config.allow_pca_fallback:
         latent_table, model, fallback_info = fit_pca_fallback(
             cleaned=cleaned,
             metadata=metadata,
             config=config,
         )
+        pca_fallback_used = True
         output_tables["pca_fallback_explained_variance"] = fallback_info
-        warnings.append("PCA fallback was used because CLIPn latent output was unavailable.")
+        warnings.append("PCA fallback was used because CLIPn latent output was unavailable. This is not a CLIPn latent space.")
+    output_tables["clipn_backend_provenance"] = collect_clipn_backend_provenance(
+        backend_module=config.backend_module,
+        backend_run=str(run_status["backend_run"].iloc[0]) if "backend_run" in run_status.columns else "unknown",
+        pca_fallback_used=pca_fallback_used,
+        loss_table=loss_table,
+    )
     if not latent_table.empty:
         output_tables["clipn_latent"] = latent_table
         if not loss_table.empty:
@@ -1292,7 +1369,7 @@ def run_clipn_workflow(
             "This report summarises the optional CLIPn workflow. The adapter first harmonises "
             "features across datasets, cleans non-finite values, handles missing data, scales "
             "features, removes only empty all-zero rows/features as QC, audits literal zeros without changing them, and then runs a compatible CLIPn backend when available. If the backend "
-            "is unavailable, the report records the reason and preserves all preprocessing audits."
+            "is unavailable, the report records the reason and preserves all preprocessing audits. Single-dataset splits are software validation checks, not true multi-dataset integration benchmarks."
         ),
         warnings=warnings,
         methods_text=(
@@ -1300,7 +1377,7 @@ def run_clipn_workflow(
             "intersection before model fitting to prevent accidental feature-order drift between "
             "datasets and requires at least two non-empty datasets. Metadata and encoded labels are excluded from the input feature matrix. "
             "Latent-space diagnostics are descriptive checks of replicate, class and dataset "
-            "structure; they should be interpreted alongside the non-AI CPATK workflow."
+            "structure; they should be interpreted alongside the non-AI CPATK workflow. CPATK reports backend provenance so that PCA fallback output is not mistaken for true CLIPn biology."
         ),
     )
     return output_tables

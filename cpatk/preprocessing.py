@@ -39,6 +39,8 @@ def validate_preprocessing_parameters(
     max_sample_missing_fraction: float,
     max_absolute_correlation: float,
     min_unique_values: int,
+    correlation_method: str = "spearman",
+    correlation_filter_strategy: str = "variance",
     max_zero_fraction: float = 1.0,
     all_zero_row_tolerance: float = 0.0,
 ) -> None:
@@ -51,6 +53,20 @@ def validate_preprocessing_parameters(
         raise ValueError("max_absolute_correlation must be in the interval (0, 1].")
     if min_unique_values < 1:
         raise ValueError("min_unique_values must be at least 1.")
+    valid_correlation_methods = {"pearson", "spearman", "kendall"}
+    if correlation_method.lower() not in valid_correlation_methods:
+        raise ValueError(
+            "correlation_method must be one of: "
+            + ", ".join(sorted(valid_correlation_methods))
+            + "."
+        )
+    valid_correlation_strategies = {"variance", "min_redundancy", "table_order"}
+    if correlation_filter_strategy.lower() not in valid_correlation_strategies:
+        raise ValueError(
+            "correlation_filter_strategy must be one of: "
+            + ", ".join(sorted(valid_correlation_strategies))
+            + "."
+        )
     if not 0 <= max_zero_fraction <= 1:
         raise ValueError("max_zero_fraction must be between 0 and 1.")
     if all_zero_row_tolerance < 0:
@@ -858,7 +874,21 @@ def _summarise_stage_batch_association(
     records = []
     for column in valid:
         labels = metadata[column].astype(str).reset_index(drop=True)
+        n_groups = int(labels.nunique(dropna=False))
         for component_index in range(scores.shape[1]):
+            if n_groups < 2:
+                records.append(
+                    {
+                        "stage": stage,
+                        "metadata_column": column,
+                        "component": f"PC{component_index + 1}",
+                        "status": "not_testable_single_group",
+                        "eta_squared": float("nan"),
+                        "n_groups": n_groups,
+                        "n_profiles": int(features.shape[0]),
+                    }
+                )
+                continue
             component = scores[:, component_index]
             grand_mean = float(np.nanmean(component))
             total_ss = float(np.nansum((component - grand_mean) ** 2))
@@ -873,7 +903,7 @@ def _summarise_stage_batch_association(
                     "component": f"PC{component_index + 1}",
                     "status": "tested",
                     "eta_squared": float(between_ss / total_ss) if total_ss > 0 else float("nan"),
-                    "n_groups": int(labels.nunique(dropna=False)),
+                    "n_groups": n_groups,
                     "n_profiles": int(features.shape[0]),
                 }
             )
@@ -941,27 +971,75 @@ def scale_features(
     return pd.DataFrame(data=values, columns=features.columns, index=features.index)
 
 
+def _rank_features_for_correlation_filter(
+    *,
+    features: pd.DataFrame,
+    correlation: pd.DataFrame,
+    variances: pd.Series,
+    strategy: str,
+) -> List[str]:
+    """Rank features by the priority with which they should be retained.
+
+    The default ``variance`` strategy keeps the highest-variance feature first
+    within a set of mutually redundant features.  This mirrors the legacy Cell
+    Painting scripts and is appropriate after the global variance filter has
+    removed uninformative near-constant features.
+    """
+    strategy = strategy.lower()
+    columns = list(features.columns)
+    if strategy == "table_order":
+        return columns
+    if strategy == "min_redundancy":
+        mean_abs_correlation = correlation.copy()
+        if not mean_abs_correlation.empty:
+            np.fill_diagonal(mean_abs_correlation.values, 0.0)
+        score = mean_abs_correlation.mean(axis=0).fillna(0.0)
+        return list(score.sort_values(ascending=True, kind="mergesort").index)
+    if strategy == "variance":
+        return list(variances.sort_values(ascending=False, kind="mergesort").index)
+    raise ValueError(f"Unsupported correlation_filter_strategy: {strategy}")
+
+
 def remove_correlated_features(
     *,
     features: pd.DataFrame,
     max_absolute_correlation: float = 0.95,
     max_features_for_correlation: int = 5000,
+    correlation_method: str = "spearman",
+    correlation_filter_strategy: str = "variance",
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Remove one feature from each highly correlated pair.
+    """Remove redundant highly correlated features.
 
-    Features with more missing values and lower variance are preferentially
-    removed.  This is more defensible than removing whichever feature happens to
-    appear later in the table.
+    A full all-vs-all absolute correlation matrix is calculated when the feature
+    count is below ``max_features_for_correlation``.  Features are then visited
+    in a configurable priority order.  The default is Spearman correlation with
+    variance-prioritised retention: the highest-variance feature in a redundant
+    group is kept and later highly correlated features are removed.  Spearman is
+    the default because Cell Painting features are commonly non-normal and often
+    monotonic rather than strictly linearly related.
     """
     report_columns = [
         "status",
         "removed_feature",
         "retained_feature",
         "correlation",
+        "correlation_method",
+        "correlation_filter_strategy",
         "n_features",
         "max_features_for_correlation",
     ]
+    method = correlation_method.lower()
+    strategy = correlation_filter_strategy.lower()
+    valid_methods = {"pearson", "spearman", "kendall"}
+    if method not in valid_methods:
+        raise ValueError("correlation_method must be one of: kendall, pearson, spearman.")
+    valid_strategies = {"variance", "min_redundancy", "table_order"}
+    if strategy not in valid_strategies:
+        raise ValueError(
+            "correlation_filter_strategy must be one of: "
+            "min_redundancy, table_order, variance."
+        )
     if features.shape[1] <= 1:
         return features.copy(), pd.DataFrame(columns=report_columns)
     if features.shape[1] > max_features_for_correlation:
@@ -978,53 +1056,79 @@ def remove_correlated_features(
                     "removed_feature": "",
                     "retained_feature": "",
                     "correlation": np.nan,
+                    "correlation_method": method,
+                    "correlation_filter_strategy": strategy,
                     "n_features": int(features.shape[1]),
                     "max_features_for_correlation": int(max_features_for_correlation),
                 }
             ]
         )
-    correlation = features.corr(method="pearson").abs()
-    variances = features.var(axis=0, skipna=True).fillna(0)
-    missing = features.isna().mean(axis=0)
-    to_remove = set()
+    numeric_features = features.select_dtypes(include=[np.number])
+    if numeric_features.shape[1] != features.shape[1] and logger is not None:
+        ignored = sorted(set(features.columns) - set(numeric_features.columns))
+        logger.warning("Ignoring non-numeric columns in correlation filter: %s", ignored[:10])
+    if numeric_features.shape[1] <= 1:
+        return numeric_features.copy(), pd.DataFrame(columns=report_columns)
+
+    correlation = numeric_features.corr(method=method).abs().fillna(0.0)
+    variances = numeric_features.var(axis=0, skipna=True).fillna(0.0)
+    missing = numeric_features.isna().mean(axis=0)
+    priority = _rank_features_for_correlation_filter(
+        features=numeric_features,
+        correlation=correlation,
+        variances=variances,
+        strategy=strategy,
+    )
+    priority_rank = {feature: rank for rank, feature in enumerate(priority, start=1)}
+    retained: List[str] = []
+    removed = set()
     records = []
-    columns = list(features.columns)
-    for i, first in enumerate(columns):
-        if first in to_remove:
+
+    for candidate in priority:
+        if candidate in removed:
             continue
-        for second in columns[i + 1:]:
-            if second in to_remove:
-                continue
-            corr_value = correlation.loc[first, second]
-            if pd.isna(corr_value) or corr_value <= max_absolute_correlation:
-                continue
-            first_score = (float(missing[first]), -float(variances[first]))
-            second_score = (float(missing[second]), -float(variances[second]))
-            if first_score >= second_score:
-                removed, retained = first, second
-            else:
-                removed, retained = second, first
-            to_remove.add(removed)
-            records.append(
-                {
-                    "status": "removed",
-                    "removed_feature": removed,
-                    "retained_feature": retained,
-                    "correlation": float(corr_value),
-                    "n_features": int(features.shape[1]),
-                    "max_features_for_correlation": int(max_features_for_correlation),
-                    "removed_missing_fraction": float(missing[removed]),
-                    "retained_missing_fraction": float(missing[retained]),
-                    "removed_variance": float(variances[removed]),
-                    "retained_variance": float(variances[retained]),
-                }
-            )
-            if first in to_remove:
-                break
+        correlated_retained = [
+            kept
+            for kept in retained
+            if correlation.loc[candidate, kept] >= max_absolute_correlation
+        ]
+        if not correlated_retained:
+            retained.append(candidate)
+            continue
+        retained_feature = max(
+            correlated_retained,
+            key=lambda feature: float(correlation.loc[candidate, feature]),
+        )
+        corr_value = float(correlation.loc[candidate, retained_feature])
+        removed.add(candidate)
+        records.append(
+            {
+                "status": "removed",
+                "removed_feature": candidate,
+                "retained_feature": retained_feature,
+                "correlation": corr_value,
+                "correlation_method": method,
+                "correlation_filter_strategy": strategy,
+                "n_features": int(numeric_features.shape[1]),
+                "max_features_for_correlation": int(max_features_for_correlation),
+                "removed_missing_fraction": float(missing[candidate]),
+                "retained_missing_fraction": float(missing[retained_feature]),
+                "removed_variance": float(variances[candidate]),
+                "retained_variance": float(variances[retained_feature]),
+                "removed_priority_rank": int(priority_rank[candidate]),
+                "retained_priority_rank": int(priority_rank[retained_feature]),
+            }
+        )
+
     if logger is not None:
-        logger.info("Removed %s highly correlated features", len(to_remove))
-    retained_columns = [column for column in columns if column not in to_remove]
-    return features.loc[:, retained_columns].copy(), pd.DataFrame.from_records(records)
+        logger.info(
+            "Removed %s highly correlated features using method=%s strategy=%s",
+            len(removed),
+            method,
+            strategy,
+        )
+    retained_columns = [column for column in numeric_features.columns if column in set(retained)]
+    return numeric_features.loc[:, retained_columns].copy(), pd.DataFrame.from_records(records)
 
 
 
@@ -1179,6 +1283,8 @@ def preprocess_profiles(
     remove_correlated: bool = True,
     max_absolute_correlation: float = 0.95,
     max_features_for_correlation: int = 5000,
+    correlation_method: str = "spearman",
+    correlation_filter_strategy: str = "variance",
     imputation_method: str = "median",
     imputation_group_columns: Optional[Sequence[str]] = None,
     add_missing_indicators: bool = False,
@@ -1213,6 +1319,8 @@ def preprocess_profiles(
         min_unique_values=min_unique_values,
         max_zero_fraction=max_zero_fraction,
         all_zero_row_tolerance=all_zero_row_tolerance,
+        correlation_method=correlation_method,
+        correlation_filter_strategy=correlation_filter_strategy,
     )
     decisions: List[dict] = []
     if logger is not None:
@@ -1447,6 +1555,8 @@ def preprocess_profiles(
             features=features_for_correlation,
             max_absolute_correlation=max_absolute_correlation,
             max_features_for_correlation=max_features_for_correlation,
+            correlation_method=correlation_method,
+            correlation_filter_strategy=correlation_filter_strategy,
             logger=logger,
         )
         n_removed_corr = int((correlation_report.get("status", pd.Series(dtype=str)) == "removed").sum())
@@ -1455,6 +1565,8 @@ def preprocess_profiles(
             "correlation_filter",
             "Removed redundant highly correlated biological features",
             n_removed=n_removed_corr,
+            correlation_method=correlation_method,
+            correlation_filter_strategy=correlation_filter_strategy,
         )
     else:
         filtered_features = features_for_correlation.copy()
@@ -1491,6 +1603,8 @@ def preprocess_profiles(
             {"parameter": "scaling_method", "value": scaling_method},
             {"parameter": "remove_correlated", "value": str(remove_correlated)},
             {"parameter": "max_absolute_correlation", "value": str(max_absolute_correlation)},
+            {"parameter": "correlation_method", "value": str(correlation_method)},
+            {"parameter": "correlation_filter_strategy", "value": str(correlation_filter_strategy)},
             {"parameter": "max_zero_fraction", "value": str(max_zero_fraction)},
             {"parameter": "remove_all_zero_rows", "value": str(remove_all_zero_rows)},
             {"parameter": "all_zero_row_tolerance", "value": str(all_zero_row_tolerance)},
@@ -1536,6 +1650,8 @@ def preprocess_profiles(
             {"item": "max_feature_missing_fraction", "value": max_feature_missing_fraction},
             {"item": "max_sample_missing_fraction", "value": max_sample_missing_fraction},
             {"item": "max_absolute_correlation", "value": max_absolute_correlation},
+            {"item": "correlation_method", "value": correlation_method},
+            {"item": "correlation_filter_strategy", "value": correlation_filter_strategy},
             {"item": "max_zero_fraction", "value": max_zero_fraction},
             {"item": "remove_all_zero_rows", "value": str(remove_all_zero_rows)},
             {"item": "all_zero_row_tolerance", "value": all_zero_row_tolerance},

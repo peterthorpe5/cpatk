@@ -1,0 +1,1 @@
+"""Bundled CPATK report resources."""

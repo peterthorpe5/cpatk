@@ -7,7 +7,9 @@ from pathlib import Path
 
 from cpatk.io import read_table
 from cpatk.logging_utils import configure_logging
+from cpatk.method_guidance import export_ml_nn_method_guide
 from cpatk.reporting import default_methods_text, discover_plot_paths, make_html_report
+from cpatk.strategy_selection import summarise_preprocessing_strategies
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,6 +43,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=50,
         help="Maximum preview rows to show for each table in the HTML report.",
     )
+    parser.add_argument(
+        "--strategy_root",
+        default=None,
+        help="Optional preprocessing strategy-comparison root to summarise in the report.",
+    )
+    parser.add_argument(
+        "--strategy_batch_column",
+        default="Metadata_Plate",
+        help="Batch column used for strategy-comparison scoring.",
+    )
+    parser.add_argument(
+        "--strategy_compound_column",
+        default="Metadata_Compound",
+        help="Compound/treatment column used for strategy-comparison scoring.",
+    )
+    parser.add_argument(
+        "--export_method_guide",
+        action="store_true",
+        help="Write the bundled ML/NN method guide beside the report.",
+    )
     parser.add_argument("--log_level", default="INFO")
     return parser
 
@@ -67,6 +89,21 @@ def main() -> None:
     tables = {}
     for name, path in table_paths.items():
         tables[name] = read_table(path=path, logger=logger)
+
+    if args.strategy_root:
+        strategy_summary = summarise_preprocessing_strategies(
+            strategy_root=Path(args.strategy_root),
+            batch_column=args.strategy_batch_column,
+            compound_column=args.strategy_compound_column,
+            logger=logger,
+        )
+        strategy_path = output_html.parent / "normalisation_strategy_comparison.tsv"
+        strategy_summary.to_csv(strategy_path, sep="\t", index=False)
+        tables["Normalisation strategy comparison"] = strategy_summary
+        table_paths["Normalisation strategy comparison"] = strategy_path
+
+    if args.export_method_guide:
+        export_ml_nn_method_guide(output_dir=output_html.parent / "method_guides")
 
     explicit_plot_paths = [Path(value) for value in args.plot]
     auto_plot_paths: list[Path] = []

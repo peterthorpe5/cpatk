@@ -10,6 +10,7 @@ from typing import Mapping, Optional, Sequence
 import pandas as pd
 
 from cpatk.io import data_frame_to_html_table
+from cpatk.method_guidance import ml_nn_method_guide_html
 
 PLOT_SUFFIXES = {".svg", ".png", ".jpg", ".jpeg", ".pdf", ".html", ".htm"}
 DEFAULT_MAX_INLINE_SVG_BYTES = 500_000
@@ -348,6 +349,7 @@ summary {{ cursor: pointer; margin: 0.8rem 0; }}
 <section><h2>Summary</h2><div class='notice'>{html.escape(narrative or 'CPATK report generated successfully.')}</div>{warning_blocks}</section>
 {cards}
 {_quick_reading_guide()}
+{ml_nn_method_guide_html()}
 {result_map}
 {methods_block}
 <section class='toc'><h2>Table index</h2><ul>{table_toc}</ul></section>

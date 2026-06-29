@@ -10,7 +10,7 @@
 ##$ -adds l_hard gpu 1
 ##$ -adds l_hard cuda.0.name 'NVIDIA A40'
 
-# CPATK v0.2.20 fast mitotox Cell Painting stress-test workflow.
+# CPATK v0.2.21 fast mitotox Cell Painting stress-test workflow.
 #
 # This is designed as a broad validation/stress test rather than a final
 # biological analysis. It stages inputs to job-local scratch, prefers Parquet
@@ -32,7 +32,7 @@ RAW_METADATA="${RAW_METADATA:-${BASE_DIR}/metadata/KVP_MitotoxPlate_IXM_07042025
 PREMERGED_PROFILE_TABLE="${PREMERGED_PROFILE_TABLE:-${BASE_DIR}/mitotox_all_plates_image_level.tsv}"
 
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-PROJECT_OUT_DIR="${PROJECT_OUT_DIR:-${OUT_DIR:-${BASE_DIR}/cpatk_v0_2_20_mitotox_fast_${RUN_TAG}}}"
+PROJECT_OUT_DIR="${PROJECT_OUT_DIR:-${OUT_DIR:-${BASE_DIR}/cpatk_v0_2_21_mitotox_fast_${RUN_TAG}}}"
 
 USE_LOCAL_SCRATCH="${USE_LOCAL_SCRATCH:-1}"
 COPY_INPUTS_TO_SCRATCH="${COPY_INPUTS_TO_SCRATCH:-1}"
@@ -453,6 +453,7 @@ require_command cpatk-visualise
 require_command cpatk-stability
 require_command cpatk-batch
 require_command cpatk-report
+require_command cpatk-strategy-summary
 # These are expected in the full cpatk environment, but downstream stages use run_soft.
 for optional_command in cpatk-drift-qc cpatk-neighbours cpatk-moa cpatk-ml cpatk-explain cpatk-clipn; do
   if ! command -v "${optional_command}" >/dev/null 2>&1; then
@@ -907,7 +908,7 @@ if [[ "${RUN_CLIPN}" == "1" ]] && command -v cpatk-clipn >/dev/null 2>&1; then
     cpatk-clipn \
       --dataset "mitotox=${PRIMARY_TABLE}" \
       --output_dir "${OUT_DIR}/12_clipn" \
-      --experiment mitotox_cpatk_v0_2_20_fast \
+      --experiment mitotox_cpatk_v0_2_21_fast \
       --mode integrate_all \
       --split_single_dataset_by_column Metadata_Compound \
       --single_dataset_split_names reference_like,query_like \
@@ -986,11 +987,15 @@ fi
 if [[ "${RUN_FINAL_REPORT}" == "1" ]]; then
   section "Step 07: final HTML report index"
   REPORT_ARGS=(
-    --output_html "${OUT_DIR}/CPATK_mitotox_v0_2_20_fast_full_report.html"
-    --title "CPATK v0.2.20 mitotox Cell Painting stress-test report"
-    --narrative "End-to-end CPATK v0.2.20 stress test on mitotox Cell Painting data. Review metadata merge rates, profile-building/fallback status, preprocessing strategy comparison, replicate QC, batch QC, classical plots, neighbour tables, pseudo-anchor labels and optional ML/CLIPn/explainability outputs before interpreting biology."
+    --output_html "${OUT_DIR}/CPATK_mitotox_v0_2_21_fast_full_report.html"
+    --title "CPATK v0.2.21 mitotox Cell Painting stress-test report"
+    --narrative "End-to-end CPATK v0.2.21 stress test on mitotox Cell Painting data. Review metadata merge rates, profile-building/fallback status, preprocessing strategy comparison, replicate QC, batch QC, classical plots, neighbour tables, pseudo-anchor labels and optional ML/CLIPn/explainability outputs before interpreting biology."
     --warning "This is a validation workflow. Optional modules are allowed to fail so that earlier QC and preprocessing outputs are preserved."
     --warning "The ML section uses compound IDs as labels for a software smoke test unless a genuine MOA label column is supplied."
+    --strategy_root "${PREPROCESS_ROOT}"
+    --strategy_batch_column "${BATCH_COLUMN}"
+    --strategy_compound_column Metadata_Compound
+    --export_method_guide
     --log_level "${LOG_LEVEL}"
   )
   add_table_if_present "Run configuration" "${OUT_DIR}/run_configuration.tsv"
@@ -1005,6 +1010,7 @@ if [[ "${RUN_FINAL_REPORT}" == "1" ]]; then
   add_table_if_present "Primary nearest neighbours" "${PRIMARY_NN}"
   add_table_if_present "Pseudo-anchor phenotype labels" "${OUT_DIR}/09_moa/pseudo_anchor_phenotype_labels.tsv"
   add_table_if_present "CLIPn run status" "${OUT_DIR}/12_clipn/clipn_run_status.tsv"
+  add_table_if_present "CLIPn backend provenance" "${OUT_DIR}/12_clipn/clipn_backend_provenance.tsv"
   add_table_if_present "CLIPn preprocessing summary" "${OUT_DIR}/12_clipn/clipn_preprocessing_summary.tsv"
   add_table_if_present "CLIPn latent diagnostic summary" "${OUT_DIR}/12_clipn/latent_diagnostic_summary.tsv"
   add_table_if_present "Latent-space MOA predictions" "${OUT_DIR}/13_clipn_latent_moa/advanced_moa_top_predictions.tsv"
@@ -1022,4 +1028,4 @@ echo "Scratch output directory: ${OUT_DIR}"
 echo "Project output directory: ${PROJECT_OUT_DIR}"
 echo "Primary strategy: ${PRIMARY_STRATEGY}"
 echo "Primary preprocessed table: ${PRIMARY_TABLE}"
-echo "Primary report on project filesystem: ${PROJECT_OUT_DIR}/CPATK_mitotox_v0_2_20_fast_full_report.html"
+echo "Primary report on project filesystem: ${PROJECT_OUT_DIR}/CPATK_mitotox_v0_2_21_fast_full_report.html"
