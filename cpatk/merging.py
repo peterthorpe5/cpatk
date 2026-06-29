@@ -24,6 +24,7 @@ import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 
 from cpatk.features import (
@@ -383,6 +384,201 @@ def _propagate_image_keys_to_object_table(
             )
     return propagated, report
 
+
+def trim_object_table_by_robust_distance(
+    *,
+    data_frame: pd.DataFrame,
+    table_label: str,
+    group_keys: Sequence[str],
+    feature_columns: Sequence[str],
+    keep_central_fraction: float = 0.90,
+    metric: str = "q95",
+    trim_quantile: float = 0.95,
+    max_feature_missing_fraction: float = 0.70,
+    min_feature_fraction_per_object: float = 0.25,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Trim extreme object rows using a multifeature robust-distance score.
+
+    The method is deliberately optional.  Within each group, usually one image
+    or one well/profile key, CPATK computes feature-wise medians and median
+    absolute deviations, converts object rows to robust z-scores, summarises
+    each object by a multifeature distance, and keeps the central requested
+    fraction.  This is not per-feature top/bottom trimming; it removes the most
+    extreme objects according to the combined feature profile.
+    """
+    if not (0.0 < float(keep_central_fraction) <= 1.0):
+        raise ValueError("keep_central_fraction must be in (0, 1].")
+    if not (0.0 < float(trim_quantile) <= 1.0):
+        raise ValueError("trim_quantile must be in (0, 1].")
+    if not (0.0 <= float(max_feature_missing_fraction) <= 1.0):
+        raise ValueError("max_feature_missing_fraction must be in [0, 1].")
+    if not (0.0 < float(min_feature_fraction_per_object) <= 1.0):
+        raise ValueError("min_feature_fraction_per_object must be in (0, 1].")
+    if metric not in {"q", "q95", "l2", "max"}:
+        raise ValueError("metric must be one of: q, q95, l2, max.")
+
+    group_keys = list(group_keys)
+    feature_columns = [column for column in feature_columns if column in data_frame.columns]
+    missing_keys = [key for key in group_keys if key not in data_frame.columns]
+    if missing_keys:
+        raise ValueError(f"Trimming group keys are missing from {table_label}: {missing_keys}")
+    if not feature_columns:
+        empty_summary = pd.DataFrame.from_records([
+            {
+                "table_label": table_label,
+                "status": "skipped_no_features",
+                "n_objects_before": int(data_frame.shape[0]),
+                "n_objects_after": int(data_frame.shape[0]),
+                "n_objects_removed": 0,
+                "fraction_removed": 0.0,
+                "keep_central_fraction": float(keep_central_fraction),
+                "trim_metric": metric,
+                "trim_quantile": float(trim_quantile),
+                "warning": "No numeric object features were available for trimming.",
+            }
+        ])
+        return data_frame.copy(), empty_summary, pd.DataFrame()
+
+    keep_masks: List[pd.Series] = []
+    group_rows: List[Dict[str, object]] = []
+    if group_keys:
+        group_iterator = data_frame.groupby(group_keys, dropna=False, sort=False)
+    else:
+        group_iterator = [("__global__", data_frame)]
+    for key_values, group in group_iterator:
+        if not isinstance(key_values, tuple):
+            key_values = (key_values,)
+        key_record = {group_key: key_value for group_key, key_value in zip(group_keys, key_values)}
+        if not key_record:
+            key_record = {"trim_group": "__global__"}
+        group_index = group.index
+        values = group.loc[:, feature_columns].apply(pd.to_numeric, errors="coerce").astype("float32")
+        missing_fraction = values.isna().mean(axis=0)
+        usable_features = missing_fraction[missing_fraction <= float(max_feature_missing_fraction)].index.tolist()
+        n_too_missing = int(len(feature_columns) - len(usable_features))
+        if not usable_features:
+            keep_mask = pd.Series(True, index=group_index)
+            group_rows.append({
+                "table_label": table_label,
+                **key_record,
+                "status": "kept_no_usable_features",
+                "n_objects_before": int(group.shape[0]),
+                "n_objects_after": int(group.shape[0]),
+                "n_objects_removed": 0,
+                "fraction_removed": 0.0,
+                "n_features_total": int(len(feature_columns)),
+                "n_features_usable": 0,
+                "n_features_too_missing": n_too_missing,
+                "n_features_zero_mad": 0,
+                "cutoff_distance": np.nan,
+            })
+            keep_masks.append(keep_mask)
+            continue
+        matrix = values.loc[:, usable_features].to_numpy(dtype="float32")
+        medians = np.nanmedian(matrix, axis=0)
+        abs_dev = np.abs(matrix - medians)
+        mads = np.nanmedian(abs_dev, axis=0)
+        nonzero = mads > 0
+        n_zero_mad = int((~nonzero).sum())
+        if not np.any(nonzero):
+            keep_mask = pd.Series(True, index=group_index)
+            group_rows.append({
+                "table_label": table_label,
+                **key_record,
+                "status": "kept_zero_mad",
+                "n_objects_before": int(group.shape[0]),
+                "n_objects_after": int(group.shape[0]),
+                "n_objects_removed": 0,
+                "fraction_removed": 0.0,
+                "n_features_total": int(len(feature_columns)),
+                "n_features_usable": int(len(usable_features)),
+                "n_features_too_missing": n_too_missing,
+                "n_features_zero_mad": n_zero_mad,
+                "cutoff_distance": np.nan,
+            })
+            keep_masks.append(keep_mask)
+            continue
+        matrix = matrix[:, nonzero]
+        medians = medians[nonzero]
+        mads = mads[nonzero]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            robust_z = (matrix - medians) / mads
+        valid_counts = np.sum(np.isfinite(robust_z), axis=1)
+        min_required = max(1, int(np.ceil(float(min_feature_fraction_per_object) * robust_z.shape[1])))
+        enough_features = valid_counts >= min_required
+        with np.errstate(invalid="ignore", divide="ignore"):
+            if metric in {"q", "q95"}:
+                distances = np.nanquantile(np.abs(robust_z), float(trim_quantile), axis=1)
+            elif metric == "l2":
+                distances = np.sqrt(np.nanmean(robust_z * robust_z, axis=1))
+            else:
+                distances = np.nanmax(np.abs(robust_z), axis=1)
+        finite = np.isfinite(distances) & enough_features
+        if not np.any(finite):
+            keep_mask_array = np.ones(group.shape[0], dtype=bool)
+            cutoff = np.nan
+            status = "kept_no_finite_distances"
+        else:
+            cutoff = float(np.nanquantile(distances[finite], float(keep_central_fraction)))
+            keep_mask_array = (distances <= cutoff) & finite
+            status = "trimmed"
+        keep_mask = pd.Series(keep_mask_array, index=group_index)
+        n_after = int(keep_mask.sum())
+        n_before = int(group.shape[0])
+        group_rows.append({
+            "table_label": table_label,
+            **key_record,
+            "status": status,
+            "n_objects_before": n_before,
+            "n_objects_after": n_after,
+            "n_objects_removed": int(n_before - n_after),
+            "fraction_removed": float((n_before - n_after) / max(n_before, 1)),
+            "n_features_total": int(len(feature_columns)),
+            "n_features_usable": int(len(usable_features)),
+            "n_features_too_missing": n_too_missing,
+            "n_features_zero_mad": n_zero_mad,
+            "cutoff_distance": cutoff,
+        })
+        keep_masks.append(keep_mask)
+
+    combined_keep = pd.concat(keep_masks).reindex(data_frame.index).fillna(False).astype(bool)
+    trimmed = data_frame.loc[combined_keep].copy()
+    by_group = pd.DataFrame.from_records(group_rows)
+    n_before = int(data_frame.shape[0])
+    n_after = int(trimmed.shape[0])
+    summary = pd.DataFrame.from_records([
+        {
+            "table_label": table_label,
+            "status": "enabled",
+            "n_objects_before": n_before,
+            "n_objects_after": n_after,
+            "n_objects_removed": int(n_before - n_after),
+            "fraction_removed": float((n_before - n_after) / max(n_before, 1)),
+            "n_groups": int(by_group.shape[0]),
+            "n_groups_removed_gt_25pct": int((by_group.get("fraction_removed", pd.Series(dtype=float)) > 0.25).sum()),
+            "n_groups_removed_gt_50pct": int((by_group.get("fraction_removed", pd.Series(dtype=float)) > 0.50).sum()),
+            "keep_central_fraction": float(keep_central_fraction),
+            "trim_metric": metric,
+            "trim_quantile": float(trim_quantile),
+            "max_feature_missing_fraction": float(max_feature_missing_fraction),
+            "min_feature_fraction_per_object": float(min_feature_fraction_per_object),
+            "warning": (
+                "Object trimming was enabled. This can reduce segmentation/debris artefacts but may remove true extreme phenotypes. "
+                "Compare trimmed and untrimmed runs for sensitive biological conclusions."
+            ),
+        }
+    ])
+    if logger is not None:
+        logger.info(
+            "Object trimming %s: kept %s / %s rows (removed %.1f%%).",
+            table_label,
+            n_after,
+            n_before,
+            100.0 * (n_before - n_after) / max(n_before, 1),
+        )
+    return trimmed, summary, by_group
+
 def _aggregate_object_table(
     *,
     data_frame: pd.DataFrame,
@@ -390,8 +586,15 @@ def _aggregate_object_table(
     statistic: str = "median",
     include_qc_numeric_features: bool = False,
     group_keys: Optional[Sequence[str]] = None,
+    trim_objects: bool = False,
+    trim_keep_central_fraction: float = 0.90,
+    trim_metric: str = "q95",
+    trim_quantile: float = 0.95,
+    trim_max_feature_missing_fraction: float = 0.70,
+    trim_min_feature_fraction_per_object: float = 0.25,
+    trim_group_keys: Optional[Sequence[str]] = None,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Aggregate one object-level table to image-level profiles.
 
     Parameters
@@ -436,6 +639,34 @@ def _aggregate_object_table(
     )
     if not feature_columns:
         raise ValueError(f"No object-level feature columns were found in {table_label}.")
+    trim_summary = pd.DataFrame.from_records([
+        {
+            "table_label": table_label,
+            "status": "disabled",
+            "n_objects_before": int(data_frame.shape[0]),
+            "n_objects_after": int(data_frame.shape[0]),
+            "n_objects_removed": 0,
+            "fraction_removed": 0.0,
+            "keep_central_fraction": float(trim_keep_central_fraction),
+            "trim_metric": trim_metric,
+            "trim_quantile": float(trim_quantile),
+            "warning": "Object trimming was not enabled.",
+        }
+    ])
+    trim_by_group = pd.DataFrame()
+    if trim_objects:
+        data_frame, trim_summary, trim_by_group = trim_object_table_by_robust_distance(
+            data_frame=data_frame,
+            table_label=table_label,
+            group_keys=list(trim_group_keys or group_keys),
+            feature_columns=feature_columns,
+            keep_central_fraction=trim_keep_central_fraction,
+            metric=trim_metric,
+            trim_quantile=trim_quantile,
+            max_feature_missing_fraction=trim_max_feature_missing_fraction,
+            min_feature_fraction_per_object=trim_min_feature_fraction_per_object,
+            logger=logger,
+        )
     features = data_frame[[*group_keys, *feature_columns]].copy()
     for feature in feature_columns:
         features[feature] = pd.to_numeric(features[feature], errors="coerce")
@@ -456,6 +687,10 @@ def _aggregate_object_table(
                 "table_label": table_label,
                 "n_input_rows": int(data_frame.shape[0]),
                 "n_input_columns": int(data_frame.shape[1]),
+                "trimming_enabled": bool(trim_objects),
+                "n_object_rows_after_trimming": int(data_frame.shape[0]),
+                "n_object_rows_removed_by_trimming": int(trim_summary.loc[0, "n_objects_removed"]),
+                "fraction_object_rows_removed_by_trimming": float(trim_summary.loc[0, "fraction_removed"]),
                 "n_feature_columns_aggregated": int(len(feature_columns)),
                 "n_image_profiles": int(aggregated.shape[0]),
                 "aggregation_statistic": statistic,
@@ -475,7 +710,7 @@ def _aggregate_object_table(
             len(feature_columns),
             aggregated.shape[0],
         )
-    return aggregated, report
+    return aggregated, report, trim_summary, trim_by_group
 
 
 
@@ -783,6 +1018,13 @@ def build_profiles_from_folder(
     duplicate_image_policy: str = "error",
     metadata_duplicate_policy: str = "error",
     image_merge_keys: Optional[Sequence[str] | str] = None,
+    trim_objects: bool = False,
+    trim_keep_central_fraction: float = 0.90,
+    trim_scope: str = "image",
+    trim_metric: str = "q95",
+    trim_quantile: float = 0.95,
+    trim_max_feature_missing_fraction: float = 0.70,
+    trim_min_feature_fraction_per_object: float = 0.25,
     logger: Optional[logging.Logger] = None,
 ) -> ProfileBuildResult:
     """Build an analysis-ready profile table from a folder of Cell Painting files.
@@ -813,6 +1055,14 @@ def build_profiles_from_folder(
     image_merge_keys:
         Optional explicit image/object merge keys. Multi-plate projects often
         require ``Metadata_Plate,ImageNumber``.
+    trim_objects:
+        Whether to trim extreme object rows before object-table aggregation.
+        Disabled by default because trimming may remove true extreme phenotypes.
+    trim_keep_central_fraction:
+        Fraction of object rows to retain within each trimming group.
+    trim_scope:
+        ``image`` uses the image/profile merge keys. ``plate`` uses Metadata_Plate
+        when present. ``global`` trims all rows in a table as one group.
     logger:
         Optional logger.
 
@@ -855,6 +1105,8 @@ def build_profiles_from_folder(
     )
 
     aggregation_reports: List[pd.DataFrame] = []
+    object_trimming_summaries: List[pd.DataFrame] = []
+    object_trimming_by_group_reports: List[pd.DataFrame] = []
     object_column_reports: List[pd.DataFrame] = []
     object_key_propagation_reports: List[pd.DataFrame] = []
     for object_path in object_paths:
@@ -882,15 +1134,33 @@ def build_profiles_from_folder(
             requested_keys=image_merge_keys,
             require_image_number=True,
         )
-        aggregated, report = _aggregate_object_table(
+        if trim_scope == "global":
+            object_trim_group_keys = []
+        elif trim_scope == "plate" and "Metadata_Plate" in object_clean.columns:
+            object_trim_group_keys = ["Metadata_Plate"]
+        elif trim_scope in {"image", "per_image", "per_profile", "per_well"}:
+            object_trim_group_keys = object_merge_keys
+        else:
+            object_trim_group_keys = object_merge_keys
+        aggregated, report, trim_summary, trim_by_group = _aggregate_object_table(
             data_frame=object_clean,
             table_label=table_label,
             statistic=aggregate_statistic,
             include_qc_numeric_features=include_qc_numeric_features,
             group_keys=object_merge_keys,
+            trim_objects=trim_objects,
+            trim_group_keys=object_trim_group_keys,
+            trim_keep_central_fraction=trim_keep_central_fraction,
+            trim_metric=trim_metric,
+            trim_quantile=trim_quantile,
+            trim_max_feature_missing_fraction=trim_max_feature_missing_fraction,
+            trim_min_feature_fraction_per_object=trim_min_feature_fraction_per_object,
             logger=logger,
         )
         aggregation_reports.append(report)
+        object_trimming_summaries.append(trim_summary)
+        if not trim_by_group.empty:
+            object_trimming_by_group_reports.append(trim_by_group)
         before_rows = profiles.shape[0]
         profiles = profiles.merge(aggregated, on=object_merge_keys, how="left", validate="one_to_one")
         if logger is not None:
@@ -937,6 +1207,10 @@ def build_profiles_from_folder(
             {"item": "duplicate_image_policy", "value": duplicate_image_policy},
             {"item": "metadata_duplicate_policy", "value": metadata_duplicate_policy},
             {"item": "image_merge_keys", "value": ";".join(_parse_merge_key_list(image_merge_keys) or [])},
+            {"item": "object_trimming_enabled", "value": bool(trim_objects)},
+            {"item": "object_trimming_scope", "value": trim_scope},
+            {"item": "object_trimming_keep_central_fraction", "value": float(trim_keep_central_fraction)},
+            {"item": "object_trimming_metric", "value": trim_metric},
             {"item": "external_metadata_tables", "value": ";".join(str(path) for path in metadata_paths)},
             {"item": "n_profiles", "value": int(profiles.shape[0])},
             {"item": "n_columns", "value": int(profiles.shape[1])},
@@ -970,6 +1244,8 @@ def build_profiles_from_folder(
         "final_profile_column_inventory": final_inventory,
         "retained_profile_features": pd.DataFrame({"feature": feature_columns}),
         "object_aggregation_report": pd.concat(aggregation_reports, ignore_index=True) if aggregation_reports else pd.DataFrame(),
+        "object_trimming_summary": pd.concat(object_trimming_summaries, ignore_index=True) if object_trimming_summaries else pd.DataFrame(),
+        "object_trimming_by_group": pd.concat(object_trimming_by_group_reports, ignore_index=True) if object_trimming_by_group_reports else pd.DataFrame(),
         "object_key_propagation_report": pd.concat(object_key_propagation_reports, ignore_index=True) if object_key_propagation_reports else pd.DataFrame(),
         "object_column_name_report": pd.concat(object_column_reports, ignore_index=True) if object_column_reports else pd.DataFrame(),
         "metadata_merge_report": pd.concat(metadata_reports, ignore_index=True) if metadata_reports else pd.DataFrame(),
@@ -1001,6 +1277,7 @@ def _write_profile_build_outputs(
         "Object-level tables are stamped with image-level assay keys before aggregation when a unique ImageNumber mapping is available.",
         "If ImageNumber is ambiguous across plates and object tables lack plate/export keys, CPATK refuses to infer those keys.",
         "Review object_key_propagation_report and metadata_merge_report before interpreting profile-level outputs.",
+        "If object trimming was enabled, review object_trimming_summary and object_trimming_by_group; trimming may remove true extreme phenotypes as well as artefacts.",
     ]
     make_html_report(
         title="CPATK profile-build report",

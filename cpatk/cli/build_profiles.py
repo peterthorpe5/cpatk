@@ -50,6 +50,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Use Metadata_Plate,ImageNumber for independent multi-plate exports where ImageNumber restarts."
         ),
     )
+    parser.add_argument("--trim_objects", action="store_true", help="Optionally trim extreme object rows before object-table aggregation. Disabled by default.")
+    parser.add_argument("--trim_keep_central_fraction", type=float, default=0.90, help="When --trim_objects is used, fraction of object rows to keep within each trimming group.")
+    parser.add_argument("--trim_scope", default="image", choices=["image", "plate", "global"], help="Object trimming group: image/profile key, Metadata_Plate, or whole object table.")
+    parser.add_argument("--trim_metric", default="q95", choices=["q", "q95", "l2", "max"], help="Object-level robust-distance summary used for trimming.")
+    parser.add_argument("--trim_quantile", type=float, default=0.95, help="Feature-wise absolute robust-z quantile used when --trim_metric is q/q95.")
+    parser.add_argument("--trim_max_feature_missing_fraction", type=float, default=0.70, help="Drop features from trimming-distance calculation within a group above this missingness fraction.")
+    parser.add_argument("--trim_min_feature_fraction_per_object", type=float, default=0.25, help="Minimum fraction of usable features required for an object to receive a finite trimming distance.")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser
 
@@ -73,6 +80,13 @@ def main() -> None:
         duplicate_image_policy=args.duplicate_image_policy,
         metadata_duplicate_policy=args.metadata_duplicate_policy,
         image_merge_keys=args.image_merge_keys,
+        trim_objects=args.trim_objects,
+        trim_keep_central_fraction=args.trim_keep_central_fraction,
+        trim_scope=args.trim_scope,
+        trim_metric=args.trim_metric,
+        trim_quantile=args.trim_quantile,
+        trim_max_feature_missing_fraction=args.trim_max_feature_missing_fraction,
+        trim_min_feature_fraction_per_object=args.trim_min_feature_fraction_per_object,
         logger=logger,
     )
     logger.info("CPATK profile building complete")
