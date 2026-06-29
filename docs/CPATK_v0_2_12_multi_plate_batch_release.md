@@ -11,7 +11,7 @@ cpatk-combine-profiles \
   --profile_tables plate_01/merged_profiles.tsv.gz,plate_02/merged_profiles.tsv.gz \
   --output_dir results/01_profile_build/all_plates \
   --source_labels plate_01,plate_02 \
-  --key_columns Metadata_Plate,Metadata_Well \
+  --key_columns Metadata_Profile_Source,Metadata_Plate,ImageNumber,Metadata_Well \
   --feature_join union \
   --duplicate_policy error \
   --log_level INFO
@@ -23,11 +23,18 @@ This command combines already-built profile tables after each plate or export ha
 - `combine_profile_summary.tsv`
 - `input_profile_report.tsv`
 - `combined_duplicate_key_report.tsv`
+- `combined_key_candidate_report.tsv`
 - `feature_presence_matrix.tsv`
 - `retained_combined_features.tsv`
 - `combine_profiles_summary.xlsx`
 - `combine_profiles_report.html`
 - `combine_profiles.log`
+
+
+Important: for image-level profiles, `Metadata_Plate,Metadata_Well` is usually
+not a unique profile key because one well often contains many images or sites.
+Use image identity as part of the combined key, for example
+`Metadata_Profile_Source,Metadata_Plate,ImageNumber,Metadata_Well`.
 
 Use `feature_join union` when different plates have partially different features and you want preprocessing QC to decide what survives. Use `feature_join intersection` only when you deliberately want to keep features measured in every table.
 

@@ -9,6 +9,7 @@ need to be stacked into one joint analysis matrix.
 from __future__ import annotations
 
 import logging
+from itertools import combinations
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
@@ -21,6 +22,193 @@ from cpatk.reporting import make_html_report
 
 
 COMBINE_SOURCE_COLUMN = "Metadata_Profile_Source"
+
+PROFILE_KEY_PRIORITY_COLUMNS = [
+    COMBINE_SOURCE_COLUMN,
+    "Metadata_Plate",
+    "ImageNumber",
+    "Metadata_ImageNumber",
+    "Metadata_Well",
+    "Metadata_Site",
+    "Metadata_Field",
+    "Metadata_FieldID",
+    "Metadata_SiteID",
+    "Metadata_Frame",
+    "Metadata_Tile",
+]
+
+
+def _deduplicate_preserving_order(*, values: Sequence[str]) -> list[str]:
+    """Return non-empty strings once, preserving their first appearance."""
+    seen = set()
+    deduplicated = []
+    for value in values:
+        cleaned = str(value).strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        deduplicated.append(cleaned)
+    return deduplicated
+
+
+def _normalise_key_columns(
+    *,
+    key_columns: Optional[Sequence[str]],
+    tables: Sequence[pd.DataFrame],
+) -> list[str]:
+    """Return requested key columns that are present in at least one table."""
+    if key_columns is None:
+        requested = [
+            COMBINE_SOURCE_COLUMN,
+            "Metadata_Plate",
+            "ImageNumber",
+            "Metadata_Well",
+            "Metadata_Site",
+        ]
+    else:
+        requested = list(key_columns)
+    available = set().union(*(set(table.columns) for table in tables))
+    return [
+        column
+        for column in _deduplicate_preserving_order(values=requested)
+        if column in available
+    ]
+
+
+def _count_duplicate_key_rows(
+    *,
+    data_frame: pd.DataFrame,
+    key_columns: Sequence[str],
+) -> tuple[int, int]:
+    """Count duplicated rows and duplicated groups for a candidate key set."""
+    key_columns = [column for column in key_columns if column in data_frame.columns]
+    if not key_columns:
+        return 0, 0
+    duplicated = data_frame.duplicated(subset=key_columns, keep=False)
+    if not duplicated.any():
+        return 0, 0
+    n_duplicate_rows = int(duplicated.sum())
+    n_duplicate_groups = int(data_frame.loc[duplicated, key_columns].drop_duplicates().shape[0])
+    return n_duplicate_rows, n_duplicate_groups
+
+
+def make_key_candidate_report(
+    *,
+    data_frame: pd.DataFrame,
+    key_columns: Sequence[str],
+    max_extra_columns: int = 3,
+) -> pd.DataFrame:
+    """Assess likely combined-profile key sets.
+
+    Parameters
+    ----------
+    data_frame:
+        Combined profile table to check.
+    key_columns:
+        Current or requested key columns.
+    max_extra_columns:
+        Maximum number of extra candidate columns to append to the current
+        key when looking for a unique profile identifier.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Candidate key audit table. ``status`` is ``unique`` when the key set
+        identifies each row once, otherwise ``duplicate_key``.
+    """
+    base_columns = [column for column in key_columns if column in data_frame.columns]
+    base_columns = _deduplicate_preserving_order(values=base_columns)
+    available_columns = set(data_frame.columns)
+    priority_columns = [
+        column
+        for column in PROFILE_KEY_PRIORITY_COLUMNS
+        if column in available_columns and column not in base_columns
+    ]
+    records = []
+
+    candidate_sets = [base_columns]
+    for extra_count in range(1, max_extra_columns + 1):
+        for extra_columns in combinations(priority_columns, extra_count):
+            candidate_sets.append([*base_columns, *extra_columns])
+
+    seen_sets = set()
+    for candidate_columns in candidate_sets:
+        candidate_columns = _deduplicate_preserving_order(values=candidate_columns)
+        key = tuple(candidate_columns)
+        if key in seen_sets:
+            continue
+        seen_sets.add(key)
+        if not candidate_columns:
+            records.append(
+                {
+                    "status": "skipped_no_key_columns",
+                    "key_columns": "",
+                    "added_columns": "",
+                    "n_key_columns": 0,
+                    "n_duplicate_rows": 0,
+                    "n_duplicate_groups": 0,
+                    "n_missing_key_rows": 0,
+                }
+            )
+            continue
+        n_duplicate_rows, n_duplicate_groups = _count_duplicate_key_rows(
+            data_frame=data_frame,
+            key_columns=candidate_columns,
+        )
+        missing_key_rows = int(data_frame[list(candidate_columns)].isna().any(axis=1).sum())
+        added_columns = [column for column in candidate_columns if column not in base_columns]
+        records.append(
+            {
+                "status": "unique" if n_duplicate_rows == 0 else "duplicate_key",
+                "key_columns": ";".join(candidate_columns),
+                "added_columns": ";".join(added_columns),
+                "n_key_columns": int(len(candidate_columns)),
+                "n_duplicate_rows": n_duplicate_rows,
+                "n_duplicate_groups": n_duplicate_groups,
+                "n_missing_key_rows": missing_key_rows,
+            }
+        )
+
+    report = pd.DataFrame.from_records(records)
+    if report.empty:
+        return report
+    report["is_requested_key"] = report["key_columns"] == ";".join(base_columns)
+    report["is_unique"] = report["status"] == "unique"
+    report = report.sort_values(
+        by=["is_unique", "n_key_columns", "n_duplicate_rows"],
+        ascending=[False, True, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    return report
+
+
+def choose_default_key_columns(
+    *,
+    tables: Sequence[pd.DataFrame],
+    logger: Optional[logging.Logger] = None,
+) -> list[str]:
+    """Choose a sensible default key set for combined profile tables.
+
+    CPATK profile tables are usually image-level rows. In that case, well-level
+    keys are too coarse because one well often contains many images or sites.
+    The default therefore prefers source, plate and image identity where those
+    columns are available.
+    """
+    key_columns = _normalise_key_columns(key_columns=None, tables=tables)
+    if logger is not None:
+        logger.info("Using default combined-profile key columns: %s", ";".join(key_columns))
+    return key_columns
+
+
+def _format_unique_key_suggestions(*, candidate_report: pd.DataFrame) -> str:
+    """Return compact suggested unique key sets for an exception message."""
+    if candidate_report.empty or "is_unique" not in candidate_report.columns:
+        return "No unique candidate key set could be inferred."
+    unique_candidates = candidate_report.loc[candidate_report["is_unique"], "key_columns"].head(3)
+    if unique_candidates.empty:
+        return "No unique candidate key set could be inferred."
+    joined = " | ".join(str(value) for value in unique_candidates.tolist())
+    return f"Candidate unique key set(s): {joined}."
 
 
 def _normalise_label(*, path: Path, label: Optional[str], index: int) -> str:
@@ -81,7 +269,11 @@ def _select_columns_for_combination(
     for table_index, table in enumerate(tables):
         metadata_columns = infer_metadata_columns(
             data_frame=table,
-            additional_metadata_columns=[*key_columns, COMBINE_SOURCE_COLUMN],
+            additional_metadata_columns=[
+                *key_columns,
+                *PROFILE_KEY_PRIORITY_COLUMNS,
+                COMBINE_SOURCE_COLUMN,
+            ],
         )
         feature_columns = infer_feature_columns(data_frame=table, metadata_columns=metadata_columns)
         feature_sets.append(set(feature_columns))
@@ -118,6 +310,7 @@ def check_combined_key_uniqueness(
     data_frame: pd.DataFrame,
     key_columns: Sequence[str],
     duplicate_policy: str = "error",
+    candidate_report: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Check duplicate profile keys in a combined table.
 
@@ -129,6 +322,9 @@ def check_combined_key_uniqueness(
         Columns expected to define unique profiles.
     duplicate_policy:
         ``error`` or ``allow``.
+    candidate_report:
+        Optional candidate-key report used to make duplicate-key errors more
+        actionable.
 
     Returns
     -------
@@ -167,9 +363,13 @@ def check_combined_key_uniqueness(
     report["n_duplicate_groups_total"] = int(duplicate_groups.shape[0])
     if duplicate_policy == "error":
         preview = report.head(10).to_dict(orient="records")
+        suggestion_text = ""
+        if candidate_report is not None:
+            suggestion_text = " " + _format_unique_key_suggestions(candidate_report=candidate_report)
         raise ValueError(
-            f"Combined profile keys are not unique for {key_columns}. Preview: {preview}. "
-            "Use a more specific key set, or rerun only after reviewing with duplicate_policy='allow'."
+            f"Combined profile keys are not unique for {key_columns}. Preview: {preview}."
+            f"{suggestion_text} Use a more specific key set, or rerun only after "
+            "reviewing with duplicate_policy='allow'."
         )
     if duplicate_policy != "allow":
         raise ValueError("duplicate_policy must be either error or allow.")
@@ -197,8 +397,8 @@ def combine_profile_tables(
     source_labels:
         Optional labels, one per table.
     key_columns:
-        Columns expected to define unique profiles after combining. Defaults to
-        ``Metadata_Plate, Metadata_Well, Metadata_Site`` where present.
+        Columns expected to define unique profiles after combining. If omitted,
+        CPATK prefers source, plate and image identity where present.
     feature_join:
         ``union`` keeps all features and fills missing table-specific features
         as missing values; ``intersection`` keeps only features present in all
@@ -248,8 +448,9 @@ def combine_profile_tables(
             }
         )
     if key_columns is None:
-        default_keys = ["Metadata_Plate", "Metadata_Well", "Metadata_Site"]
-        key_columns = [column for column in default_keys if any(column in table.columns for table in prepared_tables)]
+        key_columns = choose_default_key_columns(tables=prepared_tables, logger=logger)
+    else:
+        key_columns = _normalise_key_columns(key_columns=key_columns, tables=prepared_tables)
     key_columns = list(key_columns or [])
     selected_columns, feature_presence = _select_columns_for_combination(
         tables=prepared_tables,
@@ -258,10 +459,15 @@ def combine_profile_tables(
     )
     aligned = [table.reindex(columns=selected_columns) for table in prepared_tables]
     combined = pd.concat(aligned, axis=0, ignore_index=True)
+    key_candidate_report = make_key_candidate_report(
+        data_frame=combined,
+        key_columns=key_columns,
+    )
     duplicate_report = check_combined_key_uniqueness(
         data_frame=combined,
         key_columns=key_columns,
         duplicate_policy=duplicate_policy,
+        candidate_report=key_candidate_report,
     )
     feature_columns = infer_feature_columns(
         data_frame=combined,
@@ -289,6 +495,7 @@ def combine_profile_tables(
         "combine_profile_summary": summary,
         "input_profile_report": pd.DataFrame.from_records(input_records),
         "combined_duplicate_key_report": duplicate_report,
+        "combined_key_candidate_report": key_candidate_report,
         "feature_presence_matrix": feature_presence,
         "column_name_report": pd.concat(column_reports, ignore_index=True),
         "metadata_alias_report": pd.concat(alias_reports, ignore_index=True),

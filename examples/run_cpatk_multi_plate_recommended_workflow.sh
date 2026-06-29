@@ -71,7 +71,7 @@ cpatk-combine-profiles \
   --profile_tables "${PLATE01_PROFILE},${PLATE02_PROFILE}" \
   --output_dir "${OUT_DIR}/01_profile_build/all_plates" \
   --source_labels plate_01,plate_02 \
-  --key_columns Metadata_Plate,Metadata_Well \
+  --key_columns Metadata_Profile_Source,Metadata_Plate,ImageNumber,Metadata_Well \
   --feature_join union \
   --duplicate_policy error \
   --log_level INFO

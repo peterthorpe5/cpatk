@@ -24,7 +24,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--key_columns",
         default=None,
-        help="Optional comma-separated unique profile keys, for example Metadata_Plate,Metadata_Well,Metadata_Site.",
+        help=(
+            "Optional comma-separated unique profile keys. For image-level "
+            "profiles, use a key that includes image identity, for example "
+            "Metadata_Profile_Source,Metadata_Plate,ImageNumber. If omitted, "
+            "CPATK prefers source, plate and image identity where available."
+        ),
     )
     parser.add_argument("--feature_join", default="union", choices=["union", "intersection"])
     parser.add_argument("--duplicate_policy", default="error", choices=["error", "allow"])
