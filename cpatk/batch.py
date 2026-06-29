@@ -125,6 +125,7 @@ def cross_validated_batch_prediction(
     n_splits: int = 5,
     random_state: int = 42,
     logger: Optional[logging.Logger] = None,
+    n_jobs: int = 1,
 ) -> pd.DataFrame:
     """Estimate whether batch/domain labels are predictable from profiles.
 
@@ -142,6 +143,8 @@ def cross_validated_batch_prediction(
         Random seed.
     logger:
         Optional logger.
+    n_jobs:
+        Number of jobs for the random forest and cross-validation.
 
     Returns
     -------
@@ -170,7 +173,13 @@ def cross_validated_batch_prediction(
         n_jobs=1,
     )
     cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=random_state)
-    predicted = cross_val_predict(estimator=model, X=features, y=labels, cv=cv)
+    predicted = cross_val_predict(
+        estimator=model,
+        X=features,
+        y=labels,
+        cv=cv,
+        n_jobs=max(1, int(n_jobs)),
+    )
     accuracy = accuracy_score(y_true=labels, y_pred=predicted)
     balanced = balanced_accuracy_score(y_true=labels, y_pred=predicted)
     if logger is not None:

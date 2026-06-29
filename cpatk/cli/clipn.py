@@ -1,4 +1,4 @@
-"""Command-line optional CLIPn workflow for CPATK."""
+"""Command-line latent embedding workflow for CPATK."""
 
 from __future__ import annotations
 
@@ -15,13 +15,14 @@ from cpatk.clipn_adapter import (
 from cpatk.features import parse_column_list
 from cpatk.io import read_table
 from cpatk.logging_utils import configure_logging
+from cpatk.threading_utils import configure_threading
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line argument parser."""
     parser = argparse.ArgumentParser(
         description=(
-            "Run the optional CPATK CLIPn workflow. Inputs should usually be "
+            "Run the optional CPATK latent embedding workflow. Inputs should usually be "
             "preprocessed CPATK profile tables, one per dataset/reference/query."
         )
     )
@@ -49,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated reference dataset names for --mode reference_only.",
     )
-    parser.add_argument("--backend_module", default="clipn")
+    parser.add_argument("--backend_module", default="cpatk_contrastive", help="Latent backend module. Default is cpatk_contrastive. Use clipn only when the published external CLIPn package is explicitly requested.")
     parser.add_argument("--model_class", default=None)
     parser.add_argument("--fit_method", default="fit")
     parser.add_argument("--predict_method", default="predict")
@@ -64,7 +65,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clipn_patience", type=int, default=20, help="Reported loss rows without improvement before stopping when --clipn_early_stopping is enabled.")
     parser.add_argument("--clipn_min_delta", type=float, default=1e-4, help="Minimum loss improvement required to reset CLIPn early-stopping patience.")
     parser.add_argument("--clipn_epoch_chunk_size", type=int, default=10, help="Epochs per backend fit call when --clipn_early_stopping is enabled.")
-    parser.add_argument("--clipn_validation_fraction", type=float, default=0.0, help="Recorded for provenance. Current generic CLIPn backend uses training-loss monitoring because it lacks a validation hook.")
+    parser.add_argument("--clipn_validation_fraction", type=float, default=0.15, help="Validation fraction for CPATK-native contrastive training; recorded for provenance for the external CLIPn backend.")
+    parser.add_argument("--native_positive_column", default=None, help="Positive-pair column for --backend_module cpatk_contrastive. Defaults to --id_column, usually cpd_id.")
+    parser.add_argument("--native_hidden_dims", default="512,256", help="Comma-separated hidden layer sizes for the CPATK-native contrastive encoder.")
+    parser.add_argument("--native_activation", choices=["gelu", "relu", "elu", "leaky_relu"], default="gelu")
+    parser.add_argument("--native_normalisation", choices=["none", "layernorm", "batchnorm"], default="layernorm")
+    parser.add_argument("--native_dropout", type=float, default=0.10)
+    parser.add_argument("--native_batch_size", type=int, default=256)
+    parser.add_argument("--native_positives_per_label", type=int, default=2)
+    parser.add_argument("--native_temperature", type=float, default=0.10)
+    parser.add_argument("--native_weight_decay", type=float, default=1e-4)
+    parser.add_argument("--native_eval_batches", type=int, default=4)
+    parser.add_argument("--native_steps_per_epoch", type=int, default=0, help="Sampled training mini-batches per epoch for cpatk_contrastive. Use 0 for automatic sizing from training rows and batch size.")
+    parser.add_argument("--native_device", default="auto", help="auto, cpu, cuda, or a specific torch device such as cuda:0.")
+    parser.add_argument("--threads", type=int, default=1, help="Thread count for supported CPU/native-library operations. GPU training still uses the selected CUDA device.")
+    parser.add_argument("--native_encode_chunk_size", type=int, default=32768)
     parser.add_argument(
         "--imputation_method",
         choices=["none", "median", "mean", "knn"],
@@ -191,6 +206,17 @@ def _dataset_paths_from_args(args: argparse.Namespace, logger) -> dict[str, Path
     return parse_named_datasets(values=args.dataset or [])
 
 
+
+def parse_int_list(*, value: str) -> list[int]:
+    """Parse a comma-separated integer list."""
+    output = []
+    for item in str(value or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        output.append(int(item))
+    return output
+
 def main() -> None:
     """Run the command-line entry point."""
     args = build_parser().parse_args()
@@ -200,7 +226,8 @@ def main() -> None:
         log_file=output_dir / "clipn_adapter.log",
         log_level=args.log_level,
     )
-    logger.info("Starting CPATK CLIPn workflow")
+    threads = configure_threading(n_threads=args.threads, logger=logger)
+    logger.info("Starting CPATK latent embedding workflow")
     logger.info("Arguments: %s", vars(args))
     dataset_paths = _dataset_paths_from_args(args, logger)
     datasets, alias_report = load_clipn_datasets(dataset_paths=dataset_paths, logger=logger)
@@ -260,6 +287,20 @@ def main() -> None:
         zero_policy=args.clipn_zero_policy,
         zero_epsilon=args.clipn_zero_epsilon,
         allow_pca_fallback=args.allow_pca_fallback,
+        native_positive_column=args.native_positive_column,
+        native_hidden_dims=parse_int_list(value=args.native_hidden_dims),
+        native_activation=args.native_activation,
+        native_normalisation=args.native_normalisation,
+        native_dropout=args.native_dropout,
+        native_batch_size=args.native_batch_size,
+        native_positives_per_label=args.native_positives_per_label,
+        native_temperature=args.native_temperature,
+        native_weight_decay=args.native_weight_decay,
+        native_eval_batches=args.native_eval_batches,
+        native_steps_per_epoch=(None if args.native_steps_per_epoch <= 0 else args.native_steps_per_epoch),
+        native_device=args.native_device,
+        native_encode_chunk_size=args.native_encode_chunk_size,
+        n_threads=threads,
     )
     run_clipn_workflow(
         datasets=datasets,
@@ -268,7 +309,7 @@ def main() -> None:
         logger=logger,
         save_model_path=Path(args.save_model) if args.save_model else None,
     )
-    logger.info("CPATK CLIPn workflow complete")
+    logger.info("CPATK latent embedding workflow complete")
 
 
 if __name__ == "__main__":

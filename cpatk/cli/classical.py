@@ -13,6 +13,7 @@ from cpatk.io import read_table, write_excel_workbook, write_table
 from cpatk.logging_utils import configure_logging
 from cpatk.plotting import plot_embedding, plot_heatmap, plot_pca_variance, write_interactive_embedding_html, write_interactive_heatmap_html
 from cpatk.reporting import default_methods_text, make_html_report
+from cpatk.threading_utils import configure_threading
 from cpatk.visualisation import draw_clustered_heatmap
 
 
@@ -30,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n_neighbours", type=int, default=10)
     parser.add_argument("--n_clusters", type=int, default=8)
     parser.add_argument("--run_tsne", action="store_true")
+    parser.add_argument("--threads", type=int, default=1, help="Thread count for supported distance/native-library operations.")
     parser.add_argument("--log_level", default="INFO")
     return parser
 
@@ -40,6 +42,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = configure_logging(log_file=output_dir / "classical.log", log_level=args.log_level)
+    threads = configure_threading(n_threads=args.threads, logger=logger)
     data_frame = read_table(path=args.input_table, logger=logger)
     metadata, features, _, _ = split_metadata_and_features(
         data_frame=data_frame,
@@ -49,7 +52,11 @@ def main() -> None:
 
     pca_scores, pca_variance = run_pca(features=features, n_components=2)
     embedding = run_umap_or_pca(features=features, n_components=2, logger=logger)
-    distance_matrix = calculate_pairwise_distance_matrix(features=features, metric=args.distance_metric)
+    distance_matrix = calculate_pairwise_distance_matrix(
+        features=features,
+        metric=args.distance_metric,
+        n_jobs=threads,
+    )
     neighbours = calculate_nearest_neighbours(
         distance_matrix=distance_matrix,
         metadata=metadata,
@@ -164,6 +171,7 @@ def main() -> None:
                 compound_distances = calculate_pairwise_distance_matrix(
                     features=grouped_features,
                     metric=args.distance_metric,
+                    n_jobs=threads,
                 )
                 write_table(
                     data_frame=compound_distances,

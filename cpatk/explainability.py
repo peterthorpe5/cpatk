@@ -38,6 +38,7 @@ def calculate_permutation_feature_importance(
     test_size: float = 0.3,
     random_state: int = 42,
     logger: Optional[logging.Logger] = None,
+    n_jobs: int = 1,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Calculate held-out permutation feature importance.
 
@@ -55,7 +56,11 @@ def calculate_permutation_feature_importance(
         random_state=random_state,
         stratify=stratify,
     )
-    model = build_classifier(model_name=model_name, random_state=random_state)
+    model = build_classifier(
+        model_name=model_name,
+        random_state=random_state,
+        n_jobs=1,
+    )
     model.fit(X=train_x, y=train_y)
     predicted = model.predict(X=test_x)
     baseline = balanced_accuracy_score(y_true=test_y, y_pred=predicted)
@@ -66,6 +71,7 @@ def calculate_permutation_feature_importance(
         n_repeats=max(1, int(n_repeats)),
         random_state=random_state,
         scoring="balanced_accuracy",
+        n_jobs=max(1, int(n_jobs)),
     )
     table = pd.DataFrame(
         {

@@ -10,6 +10,7 @@ from cpatk.features import parse_column_list, split_metadata_and_features
 from cpatk.io import read_table, write_excel_workbook, write_table
 from cpatk.logging_utils import configure_logging
 from cpatk.plotting import plot_heatmap
+from cpatk.threading_utils import configure_threading
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feature_columns", default=None)
     parser.add_argument("--batch_column", required=True)
     parser.add_argument("--columns_to_test", default=None)
+    parser.add_argument("--threads", type=int, default=1, help="Thread count for supported batch-prediction operations.")
     parser.add_argument("--log_level", default="INFO")
     return parser
 
@@ -31,6 +33,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = configure_logging(log_file=output_dir / "batch.log", log_level=args.log_level)
+    threads = configure_threading(n_threads=args.threads, logger=logger)
     data_frame = read_table(path=args.input_table, logger=logger)
     metadata, features, _, _ = split_metadata_and_features(
         data_frame=data_frame,
@@ -48,6 +51,7 @@ def main() -> None:
         metadata=metadata,
         batch_column=args.batch_column,
         logger=logger,
+        n_jobs=threads,
     )
     columns_to_test = parse_column_list(value=args.columns_to_test) or [args.batch_column]
     pc_association = calculate_metadata_association_with_pcs(
@@ -70,6 +74,7 @@ def main() -> None:
         title="Batch centroid distances",
         value_label="Distance",
         logger=logger,
+        n_jobs=threads,
     )
     logger.info("CPATK batch diagnostics complete")
 

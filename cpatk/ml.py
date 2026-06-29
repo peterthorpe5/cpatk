@@ -58,6 +58,7 @@ def build_classifier(
     random_state: int = 42,
     n_neighbours: int = 5,
     calibrate: bool = True,
+    n_jobs: int = 1,
 ):
     """Build a supported classifier.
 
@@ -71,6 +72,8 @@ def build_classifier(
         Neighbour count for KNN.
     calibrate:
         Whether to wrap margin-based models in probability calibration.
+    n_jobs:
+        Number of jobs for estimators that support parallel execution.
 
     Returns
     -------
@@ -78,20 +81,24 @@ def build_classifier(
         Configured classifier.
     """
     if model_name == "knn":
-        return KNeighborsClassifier(n_neighbors=n_neighbours, weights="distance")
+        return KNeighborsClassifier(
+            n_neighbors=n_neighbours,
+            weights="distance",
+            n_jobs=max(1, int(n_jobs)),
+        )
     if model_name == "random_forest":
         return RandomForestClassifier(
             n_estimators=100,
             random_state=random_state,
             class_weight="balanced",
-            n_jobs=1,
+            n_jobs=max(1, int(n_jobs)),
         )
     if model_name == "extra_trees":
         return ExtraTreesClassifier(
             n_estimators=100,
             random_state=random_state,
             class_weight="balanced",
-            n_jobs=1,
+            n_jobs=max(1, int(n_jobs)),
         )
     if model_name == "gradient_boosting":
         return GradientBoostingClassifier(random_state=random_state)
@@ -117,6 +124,7 @@ def cross_validate_classifier(
     n_splits: int = 5,
     random_state: int = 42,
     logger: Optional[logging.Logger] = None,
+    n_jobs: int = 1,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Cross-validate a classifier and return metrics and predictions.
 
@@ -134,6 +142,8 @@ def cross_validate_classifier(
         Random seed.
     logger:
         Optional logger.
+    n_jobs:
+        Number of jobs for supported estimators and cross-validation.
 
     Returns
     -------
@@ -145,9 +155,19 @@ def cross_validate_classifier(
     if counts.shape[0] < 2 or counts.min() < 2:
         raise ValueError("At least two classes with at least two profiles each are required.")
     folds = min(n_splits, int(counts.min()))
-    model = build_classifier(model_name=model_name, random_state=random_state)
+    model = build_classifier(
+        model_name=model_name,
+        random_state=random_state,
+        n_jobs=1,
+    )
     cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=random_state)
-    predicted = cross_val_predict(estimator=model, X=features, y=clean_labels, cv=cv)
+    predicted = cross_val_predict(
+        estimator=model,
+        X=features,
+        y=clean_labels,
+        cv=cv,
+        n_jobs=max(1, int(n_jobs)),
+    )
     summary = pd.DataFrame.from_records(
         [
             {
@@ -187,6 +207,7 @@ def train_predict_classifier(
     query_features: pd.DataFrame,
     model_name: ModelName = "random_forest",
     random_state: int = 42,
+    n_jobs: int = 1,
 ) -> tuple[pd.DataFrame, object]:
     """Train a classifier and predict query classes with confidence scores.
 
@@ -202,6 +223,8 @@ def train_predict_classifier(
         Classifier name.
     random_state:
         Random seed.
+    n_jobs:
+        Number of jobs for supported estimators.
 
     Returns
     -------
@@ -211,7 +234,11 @@ def train_predict_classifier(
     shared = [column for column in train_features.columns if column in query_features.columns]
     if not shared:
         raise ValueError("No shared feature columns between training and query tables.")
-    model = build_classifier(model_name=model_name, random_state=random_state)
+    model = build_classifier(
+        model_name=model_name,
+        random_state=random_state,
+        n_jobs=n_jobs,
+    )
     model.fit(X=train_features.loc[:, shared], y=train_labels.astype(str))
     predicted = model.predict(X=query_features.loc[:, shared])
     result = pd.DataFrame({"query_index": query_features.index, "predicted_class": predicted})
@@ -232,6 +259,7 @@ def compare_moa_models(
     n_splits: int = 5,
     random_state: int = 42,
     logger: Optional[logging.Logger] = None,
+    n_jobs: int = 1,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Compare multiple MOA classifiers by cross-validation.
 
@@ -249,6 +277,8 @@ def compare_moa_models(
         Random seed.
     logger:
         Optional logger.
+    n_jobs:
+        Number of jobs for supported estimators and cross-validation.
 
     Returns
     -------
@@ -266,6 +296,7 @@ def compare_moa_models(
             n_splits=n_splits,
             random_state=random_state,
             logger=logger,
+            n_jobs=n_jobs,
         )
         prediction["model_name"] = model_name
         summaries.append(summary)

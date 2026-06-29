@@ -655,3 +655,50 @@ The query-vs-background explanation summary now records whether query-vs-control
 CPATK v0.2.20 hardens raw CellProfiler profile building for multi-plate exports where the Image table contains assay keys such as `Metadata_Plate` and `Metadata_Well`, but object tables contain only `ImageNumber` and `ObjectNumber`. Before object aggregation, CPATK now propagates missing image-level assay keys onto object tables when the Image table provides a unique `ImageNumber` mapping. This allows explicit composite merge keys such as `Metadata_Plate,ImageNumber` without requiring every raw object table to already carry the plate column.
 
 If `ImageNumber` maps to more than one plate/well value and the object table lacks the disambiguating key, CPATK refuses to guess. Review `object_key_propagation_report.tsv`, `object_aggregation_report.tsv` and `metadata_merge_report.tsv` after profile building.
+
+## v0.2.26 note: CPATK-native contrastive latent embedding
+
+CPATK v0.2.26 adds a CPATK-native supervised contrastive latent backend. This is not a reimplementation of the published CLIPn package. It is an independent, CPATK-controlled latent-learning workflow designed for Cell Painting profile tables, with explicit logging, validation-aware early stopping, positive-pair audits, backend provenance and latent-space quality warnings.
+
+The default latent backend is now:
+
+```bash
+--backend_module cpatk_contrastive
+```
+
+The published external CLIPn package is no longer the default. It is only run when explicitly requested, for example:
+
+```bash
+--backend_module clipn
+```
+
+The legacy command name `cpatk-clipn` is retained for older scripts, but v0.2.26 also installs the clearer alias:
+
+```bash
+cpatk-latent
+```
+
+The native backend uses compound or profile identifiers as supervised positive-pair labels by default, usually `cpd_id`. Use `--native_positive_column` to choose a different positive-pair column. Latent embeddings should still be interpreted alongside the classical CPATK outputs; CPATK writes `latent_quality_warnings.tsv` when retrieval or dataset-leakage diagnostics suggest the latent space is weak or source dominated.
+
+## v0.2.27 note: sanity pass and safe threading controls
+
+CPATK v0.2.27 keeps the CPATK-native contrastive latent backend as the default and adds explicit safe thread controls to the supported downstream command-line tools.
+
+The following commands now accept `--threads`:
+
+```text
+cpatk-classical
+cpatk-batch
+cpatk-ml
+cpatk-explain
+cpatk-latent
+cpatk-clipn
+```
+
+The large multi-dataset SGE example has been updated to `examples/run_cpatk_v0_2_27_multidataset_stb_selleck_mitotox_full_sge.sh`. It passes `${THREADS}` to supported tools while retaining the corrected image-level combined key:
+
+```text
+Metadata_Profile_Source,Metadata_Plate,ImageNumber,Metadata_Well
+```
+
+Threading is deliberately conservative. CPATK uses thread pools for pairwise distances, cross-validation scheduling, permutation importance, supported tree/neighbour models, PyTorch CPU pools and native BLAS/OpenMP libraries, but it avoids obvious nested oversubscription in cross-validation workflows.

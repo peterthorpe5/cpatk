@@ -28,6 +28,7 @@ from cpatk.neighbourhood_explain import (
 )
 from cpatk.plotting import plot_feature_importance
 from cpatk.reporting import default_methods_text, make_html_report
+from cpatk.threading_utils import configure_threading
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test", choices=["mw", "ks"], default="mw")
     parser.add_argument("--n_top_features", type=int, default=20)
     parser.add_argument("--n_dependence_plots", type=int, default=5)
+    parser.add_argument("--threads", type=int, default=1, help="Thread count for supported permutation, tree and SHAP operations.")
 
     parser.add_argument("--disable_html_report", action="store_true")
     parser.add_argument("--log_level", default="INFO")
@@ -118,6 +120,7 @@ def _run_global_attribution(
         model_name=args.model_name,
         n_repeats=args.n_repeats,
         logger=logger,
+        n_jobs=args.threads,
     )
     family = group_feature_importance_by_family(
         importance_table=permutation,
@@ -314,7 +317,7 @@ def _run_query_neighbourhoods(
                     n_top_features=args.n_top_features,
                     max_background=args.max_shap_background,
                     max_explain=args.max_shap_explain,
-                    n_jobs=1,
+                    n_jobs=args.threads,
                     logger=logger,
                 )
                 top_features = shap_result["top_features"]  # type: ignore[index]
@@ -383,7 +386,7 @@ def _run_query_neighbourhoods(
                         n_top_features=args.n_top_features,
                         max_background=args.max_shap_background,
                         max_explain=args.max_shap_explain,
-                        n_jobs=1,
+                        n_jobs=args.threads,
                         logger=logger,
                     )
                     top_features = shap_result["top_features"]  # type: ignore[index]
@@ -478,6 +481,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = configure_logging(log_file=output_dir / "explain.log", log_level=args.log_level)
+    args.threads = configure_threading(n_threads=args.threads, logger=logger)
     data_frame = read_table(path=args.input_table, logger=logger)
 
     extra_metadata = [column for column in [args.class_column, args.id_column, args.background_column] if column]

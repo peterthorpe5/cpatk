@@ -60,6 +60,11 @@ def require_sklearn_stack(*, purpose: str) -> None:
             "LD_LIBRARY_PATH or reinstall scipy/scikit-learn from conda-forge."
         ) from SKLEARN_IMPORT_ERROR
 
+from cpatk.contrastive import (
+    NativeContrastiveConfig,
+    fit_native_contrastive_backend,
+    get_native_contrastive_status,
+)
 from cpatk.embedding import run_pca, run_umap_or_pca
 from cpatk.io import read_table, write_excel_workbook, write_table
 from cpatk.metadata import canonicalise_well_value, normalise_column_names
@@ -157,7 +162,7 @@ METADATA_NAME_PATTERNS = re.compile(
 class ClipnAdapterConfig:
     """Configuration for a CLIPn adapter run."""
 
-    backend_module: str = "clipn"
+    backend_module: str = "cpatk_contrastive"
     model_class: Optional[str] = None
     fit_method: str = "fit"
     predict_method: str = "predict"
@@ -193,10 +198,26 @@ class ClipnAdapterConfig:
     zero_policy: str = "keep"
     zero_epsilon: float = 1e-8  # Deprecated compatibility field; zeros are not replaced.
     allow_pca_fallback: bool = False
+    native_positive_column: Optional[str] = None
+    native_hidden_dims: list[int] = field(default_factory=lambda: [512, 256])
+    native_activation: str = "gelu"
+    native_normalisation: str = "layernorm"
+    native_dropout: float = 0.10
+    native_batch_size: int = 256
+    native_positives_per_label: int = 2
+    native_temperature: float = 0.10
+    native_weight_decay: float = 1e-4
+    native_eval_batches: int = 4
+    native_steps_per_epoch: Optional[int] = None
+    native_device: str = "auto"
+    native_encode_chunk_size: int = 32768
+    n_threads: int = 1
 
 
 def check_clipn_backend(*, backend_module: str = "clipn") -> pd.DataFrame:
-    """Check whether a CLIPn backend module can be imported."""
+    """Check whether a latent backend module can be imported."""
+    if str(backend_module).lower() in {"cpatk_contrastive", "native_contrastive"}:
+        return get_native_contrastive_status()
     try:
         module = importlib.import_module(name=backend_module)
         return pd.DataFrame.from_records(
@@ -262,11 +283,16 @@ def collect_clipn_backend_provenance(
     n_loss_rows = int(loss_table.shape[0]) if loss_table is not None and not loss_table.empty else 0
     final_loss = float("nan")
     min_loss = float("nan")
-    if loss_table is not None and not loss_table.empty and "loss" in loss_table.columns:
-        losses = pd.to_numeric(loss_table["loss"], errors="coerce").dropna()
-        if not losses.empty:
-            final_loss = float(losses.iloc[-1])
-            min_loss = float(losses.min())
+    if loss_table is not None and not loss_table.empty:
+        loss_column = next(
+            (column for column in ["loss", "monitor_loss", "validation_loss", "train_loss"] if column in loss_table.columns),
+            None,
+        )
+        if loss_column is not None:
+            losses = pd.to_numeric(loss_table[loss_column], errors="coerce").dropna()
+            if not losses.empty:
+                final_loss = float(losses.iloc[-1])
+                min_loss = float(losses.min())
 
     training_policy = "unknown"
     stopping_reason = "unknown"
@@ -1154,6 +1180,67 @@ def _fit_clipn_with_training_policy(
     return loss_table, training_summary
 
 
+
+def _native_config_from_clipn_config(*, config: ClipnAdapterConfig) -> NativeContrastiveConfig:
+    """Translate the shared adapter config into native contrastive config."""
+    return NativeContrastiveConfig(
+        latent_dim=int(config.latent_dim),
+        hidden_dims=list(config.native_hidden_dims),
+        activation=str(config.native_activation),
+        normalisation=str(config.native_normalisation),
+        dropout=float(config.native_dropout),
+        learning_rate=float(config.learning_rate),
+        weight_decay=float(config.native_weight_decay),
+        epochs=int(config.epochs),
+        batch_size=int(config.native_batch_size),
+        positives_per_label=int(config.native_positives_per_label),
+        temperature=float(config.native_temperature),
+        validation_fraction=float(config.validation_fraction),
+        early_stopping_patience=int(config.early_stopping_patience),
+        early_stopping_min_delta=float(config.early_stopping_min_delta),
+        eval_batches=int(config.native_eval_batches),
+        steps_per_epoch=(
+            None
+            if config.native_steps_per_epoch is None or int(config.native_steps_per_epoch) <= 0
+            else int(config.native_steps_per_epoch)
+        ),
+        random_state=int(config.random_state),
+        device=str(config.native_device),
+        positive_column=str(config.native_positive_column or config.id_column),
+        normalise_latent=bool(config.normalise_latent),
+        encode_chunk_size=int(config.native_encode_chunk_size),
+        n_threads=int(config.n_threads),
+    )
+
+
+def fit_cpatk_contrastive_backend(
+    *,
+    cleaned: Mapping[str, pd.DataFrame],
+    metadata: pd.DataFrame,
+    config: ClipnAdapterConfig,
+    logger: Optional[logging.Logger] = None,
+) -> tuple[pd.DataFrame, object, pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Fit the CPATK-native contrastive backend and return adapter-shaped output."""
+    native_config = _native_config_from_clipn_config(config=config)
+    result = fit_native_contrastive_backend(
+        cleaned=cleaned,
+        metadata=metadata,
+        config=native_config,
+        logger=logger,
+    )
+    extra_tables = {
+        "cpatk_contrastive_positive_label_report": result.positive_label_report,
+        "cpatk_contrastive_split_report": result.split_report,
+        "cpatk_contrastive_backend_status": result.backend_status,
+    }
+    return (
+        result.latent_table,
+        result.model,
+        result.training_loss,
+        result.training_summary,
+        extra_tables,
+    )
+
 def fit_clipn_backend(
     *,
     cleaned: Mapping[str, pd.DataFrame],
@@ -1257,7 +1344,11 @@ def calculate_latent_diagnostics(
 
     k = min(max(1, config.n_neighbours), X.shape[0] - 1)
     require_sklearn_stack(purpose="latent nearest-neighbour analysis")
-    nn = NearestNeighbors(n_neighbors=k + 1, metric=config.distance_metric)
+    nn = NearestNeighbors(
+        n_neighbors=k + 1,
+        metric=config.distance_metric,
+        n_jobs=max(1, int(config.n_threads)),
+    )
     nn.fit(X)
     distances, indices = nn.kneighbors(X, return_distance=True)
     rows = []
@@ -1313,6 +1404,126 @@ def calculate_latent_diagnostics(
         "nearest_neighbours": neighbours,
         "latent_diagnostic_summary": summary,
     }
+
+
+def diagnose_latent_space_quality(
+    *,
+    diagnostic_summary: pd.DataFrame,
+    config: ClipnAdapterConfig,
+    backend_module: str,
+) -> pd.DataFrame:
+    """Create interpretation warnings for latent-space diagnostics.
+
+    These warnings are deliberately conservative.  They are not used to fail
+    a run; they tell users when the latent embedding should be treated as a
+    technical visualisation rather than strong biological evidence.
+    """
+    if diagnostic_summary is None or diagnostic_summary.empty:
+        return pd.DataFrame.from_records(
+            [
+                {
+                    "backend_module": backend_module,
+                    "severity": "info",
+                    "diagnostic": "no_latent_diagnostics",
+                    "message": "No latent-space diagnostics were available for interpretation.",
+                }
+            ]
+        )
+    values = {
+        str(row["metric"]): float(row["value"])
+        for _, row in diagnostic_summary.iterrows()
+        if "metric" in diagnostic_summary.columns and "value" in diagnostic_summary.columns
+        and pd.notna(row.get("value"))
+    }
+    records = []
+    same_id_rate = values.get("nearest_neighbour_same_id_rate")
+    if same_id_rate is not None and same_id_rate < 0.25:
+        records.append(
+            {
+                "backend_module": backend_module,
+                "severity": "warning",
+                "diagnostic": "low_same_id_retrieval",
+                "message": (
+                    "Nearest-neighbour retrieval of the same compound/id is low. "
+                    "Use the latent embedding cautiously and prioritise classical CPATK diagnostics."
+                ),
+            }
+        )
+    same_label_rate = values.get("nearest_neighbour_same_label_rate")
+    if same_label_rate is not None and same_label_rate < 0.35:
+        records.append(
+            {
+                "backend_module": backend_module,
+                "severity": "warning",
+                "diagnostic": "low_same_label_retrieval",
+                "message": (
+                    "Nearest-neighbour retrieval of the same label/class is low. "
+                    "The latent space may not support strong class-level interpretation."
+                ),
+            }
+        )
+    same_dataset_rate = values.get("same_dataset_neighbour_rate")
+    if same_dataset_rate is not None and same_dataset_rate > 0.80:
+        records.append(
+            {
+                "backend_module": backend_module,
+                "severity": "warning",
+                "diagnostic": "high_same_dataset_neighbour_rate",
+                "message": (
+                    "Most latent nearest neighbours come from the same dataset/source. "
+                    "This suggests residual dataset or batch structure in the embedding."
+                ),
+            }
+        )
+    dataset_silhouette = values.get("silhouette_Dataset")
+    label_silhouette = values.get(f"silhouette_{config.label_column}")
+    if (
+        dataset_silhouette is not None
+        and label_silhouette is not None
+        and dataset_silhouette > label_silhouette
+    ):
+        records.append(
+            {
+                "backend_module": backend_module,
+                "severity": "warning",
+                "diagnostic": "dataset_structure_exceeds_label_structure",
+                "message": (
+                    "Dataset/source separation is stronger than the configured biological label separation. "
+                    "Do not treat the latent space as primarily biological without supporting diagnostics."
+                ),
+            }
+        )
+    if not records:
+        records.append(
+            {
+                "backend_module": backend_module,
+                "severity": "info",
+                "diagnostic": "latent_diagnostics_no_major_warning",
+                "message": "No major latent-space warning was triggered by the current simple diagnostic rules.",
+            }
+        )
+    return pd.DataFrame.from_records(records)
+
+
+def make_latent_backend_policy_table(*, config: ClipnAdapterConfig) -> pd.DataFrame:
+    """Return a one-row table explaining the latent backend selection policy."""
+    backend = str(config.backend_module)
+    is_native = backend.lower() in {"cpatk_contrastive", "native_contrastive"}
+    return pd.DataFrame.from_records(
+        [
+            {
+                "selected_backend_module": backend,
+                "default_backend": "cpatk_contrastive",
+                "published_clipn_run_only_if_requested": True,
+                "is_cpatk_native_backend": bool(is_native),
+                "policy": (
+                    "CPATK uses its native supervised contrastive backend by default. "
+                    "The published external CLIPn package is run only when --backend_module clipn "
+                    "or another external module is explicitly requested."
+                ),
+            }
+        ]
+    )
 
 
 def write_latent_plots(
@@ -1394,6 +1605,64 @@ def write_latent_plots(
     return [path for path in written if Path(path).exists()]
 
 
+
+def diagnose_training_curve(*, loss_table: pd.DataFrame, backend_module: str) -> pd.DataFrame:
+    """Return warning rows for suspicious latent-backend training curves."""
+    if loss_table is None or loss_table.empty:
+        return pd.DataFrame.from_records(
+            [
+                {
+                    "backend_module": backend_module,
+                    "severity": "info",
+                    "diagnostic": "no_loss_curve",
+                    "message": "No numeric training-loss curve was reported by the latent backend.",
+                }
+            ]
+        )
+    loss_columns = [column for column in ["loss", "train_loss", "monitor_loss"] if column in loss_table.columns]
+    if not loss_columns:
+        return pd.DataFrame.from_records(
+            [
+                {
+                    "backend_module": backend_module,
+                    "severity": "info",
+                    "diagnostic": "no_standard_loss_column",
+                    "message": "Training table was written, but no standard loss column was available for diagnostics.",
+                }
+            ]
+        )
+    records = []
+    for column in loss_columns:
+        values = pd.to_numeric(loss_table[column], errors="coerce").dropna()
+        if values.empty:
+            continue
+        first_value = float(values.iloc[0])
+        all_zero = bool(np.allclose(values.to_numpy(dtype=float), 0.0))
+        if all_zero:
+            records.append(
+                {
+                    "backend_module": backend_module,
+                    "severity": "warning",
+                    "diagnostic": f"{column}_all_zero",
+                    "message": (
+                        f"The reported {column} curve is zero from the first recorded epoch. "
+                        "Treat this as a suspicious backend diagnostic rather than evidence of a well-trained latent model."
+                    ),
+                }
+            )
+        elif np.isclose(first_value, 0.0):
+            records.append(
+                {
+                    "backend_module": backend_module,
+                    "severity": "warning",
+                    "diagnostic": f"{column}_starts_at_zero",
+                    "message": (
+                        f"The reported {column} starts at zero. Check whether the backend is reporting a meaningful loss."
+                    ),
+                }
+            )
+    return pd.DataFrame.from_records(records)
+
 def run_clipn_workflow(
     *,
     datasets: Mapping[str, pd.DataFrame],
@@ -1402,7 +1671,7 @@ def run_clipn_workflow(
     logger: Optional[logging.Logger] = None,
     save_model_path: Optional[Path] = None,
 ) -> Mapping[str, pd.DataFrame]:
-    """Run the full CPATK CLIPn adapter workflow."""
+    """Run the full CPATK latent embedding workflow."""
     output_dir.mkdir(parents=True, exist_ok=True)
     save_clipn_config(config=config, path=output_dir / "clipn_adapter_config.json")
     metadata = make_metadata_table(datasets=datasets, config=config)
@@ -1421,6 +1690,7 @@ def run_clipn_workflow(
     labels, label_encoder, label_report = encode_labels_for_clipn(datasets=datasets, config=config)
     status = check_clipn_backend(backend_module=config.backend_module)
     output_tables: dict[str, pd.DataFrame] = {
+        "latent_backend_policy": make_latent_backend_policy_table(config=config),
         "clipn_status": status,
         "clipn_feature_summary": feature_summary,
         "clipn_feature_report": feature_report,
@@ -1434,28 +1704,40 @@ def run_clipn_workflow(
     warnings = []
     if bool(status["available"].iloc[0]):
         try:
-            latent_table, model, loss_table, training_summary = fit_clipn_backend(
-                cleaned=cleaned,
-                labels=labels,
-                metadata=metadata,
-                config=config,
-                logger=logger,
-            )
-            run_status = pd.DataFrame(
-                [{"backend_run": "success", "message": "CLIPn backend completed."}]
-            )
+            if str(config.backend_module).lower() in {"cpatk_contrastive", "native_contrastive"}:
+                latent_table, model, loss_table, training_summary, extra_tables = fit_cpatk_contrastive_backend(
+                    cleaned=cleaned,
+                    metadata=metadata,
+                    config=config,
+                    logger=logger,
+                )
+                output_tables.update(extra_tables)
+                run_status = pd.DataFrame(
+                    [{"backend_run": "success", "message": "CPATK-native contrastive backend completed."}]
+                )
+            else:
+                latent_table, model, loss_table, training_summary = fit_clipn_backend(
+                    cleaned=cleaned,
+                    labels=labels,
+                    metadata=metadata,
+                    config=config,
+                    logger=logger,
+                )
+                run_status = pd.DataFrame(
+                    [{"backend_run": "success", "message": "External CLIPn backend completed."}]
+                )
             if save_model_path is not None and model is not None:
                 save_model_pickle(model=model, path=save_model_path)
         except Exception as exc:
             if logger is not None:
-                logger.exception("CLIPn backend execution failed.")
-            warnings.append(f"CLIPn backend execution failed: {exc}")
+                logger.exception("Latent backend execution failed.")
+            warnings.append(f"Latent backend execution failed: {exc}")
             run_status = pd.DataFrame(
                 [{"backend_run": "failed", "message": str(exc)}]
             )
     else:
         message = str(status["message"].iloc[0])
-        warnings.append(f"CLIPn backend unavailable: {message}")
+        warnings.append(f"Latent backend unavailable: {message}")
         run_status = pd.DataFrame(
             [{"backend_run": "not_run", "message": message}]
         )
@@ -1470,6 +1752,11 @@ def run_clipn_workflow(
             }
         ])
     output_tables["clipn_training_summary"] = training_summary
+    training_diagnostics = diagnose_training_curve(loss_table=loss_table, backend_module=config.backend_module)
+    if not training_diagnostics.empty:
+        output_tables["clipn_training_diagnostics"] = training_diagnostics
+        suspicious = training_diagnostics.loc[training_diagnostics["severity"].eq("warning"), "message"].astype(str).tolist()
+        warnings.extend(suspicious)
     pca_fallback_used = False
     if latent_table.empty and config.allow_pca_fallback:
         latent_table, model, fallback_info = fit_pca_fallback(
@@ -1491,7 +1778,17 @@ def run_clipn_workflow(
         output_tables["clipn_latent"] = latent_table
         if not loss_table.empty:
             output_tables["clipn_training_loss"] = loss_table
-        output_tables.update(calculate_latent_diagnostics(latent_table=latent_table, config=config))
+        latent_diagnostics = calculate_latent_diagnostics(latent_table=latent_table, config=config)
+        output_tables.update(latent_diagnostics)
+        latent_quality = diagnose_latent_space_quality(
+            diagnostic_summary=latent_diagnostics.get("latent_diagnostic_summary", pd.DataFrame()),
+            config=config,
+            backend_module=config.backend_module,
+        )
+        output_tables["latent_quality_warnings"] = latent_quality
+        warnings.extend(
+            latent_quality.loc[latent_quality["severity"].eq("warning"), "message"].astype(str).tolist()
+        )
         plot_paths = write_latent_plots(
             latent_table=latent_table,
             output_dir=output_dir,
@@ -1507,23 +1804,25 @@ def run_clipn_workflow(
             write_table(data_frame=table, path=output_dir / f"{name}.tsv", logger=logger)
     write_excel_workbook(tables=output_tables, path=output_dir / "clipn_summary.xlsx", logger=logger)
     make_html_report(
-        title="CPATK CLIPn adapter report",
+        title=("CPATK native contrastive report" if str(config.backend_module).lower() in {"cpatk_contrastive", "native_contrastive"} else "CPATK CLIPn adapter report"),
         output_path=output_dir / "clipn_report.html",
         summary_tables=output_tables,
         plot_paths=plot_paths,
         narrative=(
-            "This report summarises the optional CLIPn workflow. The adapter first harmonises "
+            "This report summarises the optional latent embedding workflow. The adapter first harmonises "
             "features across datasets, cleans non-finite values, handles missing data, scales "
-            "features, removes only empty all-zero rows/features as QC, audits literal zeros without changing them, and then runs a compatible CLIPn backend when available. If the backend "
+            "features, removes only empty all-zero rows/features as QC, audits literal zeros without changing them, and then runs the selected latent backend. If the backend "
             "is unavailable, the report records the reason and preserves all preprocessing audits. Single-dataset splits are software validation checks, not true multi-dataset integration benchmarks."
         ),
         warnings=warnings,
         methods_text=(
-            "CLIPn is treated as an optional integration layer. CPATK freezes the shared feature "
+            "Latent embedding is treated as an optional integration layer. CPATK uses its native "
+            "supervised contrastive backend by default and runs the published external CLIPn package "
+            "only when that backend is explicitly requested. CPATK freezes the shared feature "
             "intersection before model fitting to prevent accidental feature-order drift between "
             "datasets and requires at least two non-empty datasets. Metadata and encoded labels are excluded from the input feature matrix. "
             "Latent-space diagnostics are descriptive checks of replicate, class and dataset "
-            "structure; they should be interpreted alongside the non-AI CPATK workflow. CPATK reports backend provenance so that PCA fallback output is not mistaken for true CLIPn biology."
+            "structure; they should be interpreted alongside the non-AI CPATK workflow. CPATK reports backend provenance so that PCA fallback output is not mistaken for true latent-backend biology."
         ),
     )
     return output_tables
@@ -1557,7 +1856,7 @@ def run_clipn_adapter(
             "clipn_feature_report": feature_report,
         }
     # For backwards compatibility, run a lightweight workflow without writing files by
-    # performing the backend fit directly.  Errors are converted to a status table.
+    # performing the selected backend fit directly.  Errors are converted to a status table.
     try:
         metadata = make_metadata_table(datasets=datasets, config=config)
         cleaned, preprocessing = clean_impute_and_scale_aligned(
@@ -1567,14 +1866,23 @@ def run_clipn_adapter(
             logger=logger,
         )
         labels, _, label_report = encode_labels_for_clipn(datasets=datasets, config=config)
-        latent, _, loss_table, training_summary = fit_clipn_backend(
-            cleaned=cleaned,
-            labels=labels,
-            metadata=metadata,
-            config=config,
-            logger=logger,
-        )
-        return {
+        if str(config.backend_module).lower() in {"cpatk_contrastive", "native_contrastive"}:
+            latent, _, loss_table, training_summary, extra_tables = fit_cpatk_contrastive_backend(
+                cleaned=cleaned,
+                metadata=metadata,
+                config=config,
+                logger=logger,
+            )
+        else:
+            latent, _, loss_table, training_summary = fit_clipn_backend(
+                cleaned=cleaned,
+                labels=labels,
+                metadata=metadata,
+                config=config,
+                logger=logger,
+            )
+            extra_tables = {}
+        result = {
             "clipn_status": status,
             "clipn_feature_summary": feature_summary,
             "clipn_feature_report": feature_report,
@@ -1584,6 +1892,8 @@ def run_clipn_adapter(
             "clipn_training_summary": training_summary,
             "clipn_latent": latent,
         }
+        result.update(extra_tables)
+        return result
     except Exception as exc:
         if logger is not None:
             logger.warning("CLIPn adapter failed: %s", exc)

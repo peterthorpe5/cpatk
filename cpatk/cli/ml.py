@@ -11,6 +11,7 @@ from cpatk.logging_utils import configure_logging
 from cpatk.ml import compare_moa_models, cross_validate_classifier
 from cpatk.plotting import plot_confusion_matrix, plot_model_summary
 from cpatk.reporting import default_methods_text, make_html_report
+from cpatk.threading_utils import configure_threading
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,6 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compare_models", action="store_true")
     parser.add_argument("--models", default="knn,random_forest,extra_trees,gradient_boosting,logistic_regression,linear_svm")
     parser.add_argument("--n_splits", type=int, default=5)
+    parser.add_argument("--threads", type=int, default=1, help="Thread count for supported estimators and cross-validation.")
     parser.add_argument("--disable_html_report", action="store_true")
     parser.add_argument("--log_level", default="INFO")
     return parser
@@ -36,6 +38,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = configure_logging(log_file=output_dir / "ml.log", log_level=args.log_level)
+    threads = configure_threading(n_threads=args.threads, logger=logger)
     data_frame = read_table(path=args.input_table, logger=logger)
     metadata, features, _, _ = split_metadata_and_features(
         data_frame=data_frame,
@@ -53,6 +56,7 @@ def main() -> None:
             model_names=model_names,
             n_splits=args.n_splits,
             logger=logger,
+            n_jobs=threads,
         )
         tables = {"model_comparison_summary": summary, "model_comparison_predictions": predictions}
         plot_paths.extend(
@@ -71,6 +75,7 @@ def main() -> None:
             model_name=args.model_name,
             n_splits=args.n_splits,
             logger=logger,
+            n_jobs=threads,
         )
         tables = {"classifier_summary": summary, "classifier_predictions": predictions, "confusion_matrix": confusion}
         plot_paths.extend(plot_confusion_matrix(confusion_table=confusion, output_path_base=output_dir / "confusion_matrix", logger=logger))

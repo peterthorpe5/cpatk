@@ -13,6 +13,7 @@ def calculate_pairwise_distance_matrix(
     *,
     features: pd.DataFrame,
     metric: str = "cosine",
+    n_jobs: int = 1,
 ) -> pd.DataFrame:
     """Calculate a pairwise distance matrix.
 
@@ -22,13 +23,15 @@ def calculate_pairwise_distance_matrix(
         Numeric feature matrix.
     metric:
         Distance metric accepted by scikit-learn.
+    n_jobs:
+        Number of jobs for scikit-learn pairwise distance calculation.
 
     Returns
     -------
     pandas.DataFrame
         Square distance matrix.
     """
-    distances = pairwise_distances(X=features, metric=metric)
+    distances = pairwise_distances(X=features, metric=metric, n_jobs=max(1, int(n_jobs)))
     return pd.DataFrame(data=distances, index=features.index, columns=features.index)
 
 
