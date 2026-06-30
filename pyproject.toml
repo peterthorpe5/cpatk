@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cpatk"
-version = "0.2.28"
+version = "0.2.29"
 description = "Cell Painting Analysis Toolkit for generic high-content profiling, QC, classical analysis, optional AI integration, MOA classification and reporting."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -47,6 +47,7 @@ cpatk-drift-qc = "cpatk.cli.drift_qc:main"
 cpatk-neighbours = "cpatk.cli.neighbours:main"
 cpatk-metadata = "cpatk.cli.metadata:main"
 cpatk-strategy-summary = "cpatk.cli.strategy_summary:main"
+cpatk-synthetic-latent-benchmark = "cpatk.cli.synthetic_latent_benchmark:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

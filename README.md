@@ -702,3 +702,22 @@ Metadata_Profile_Source,Metadata_Plate,ImageNumber,Metadata_Well
 ```
 
 Threading is deliberately conservative. CPATK uses thread pools for pairwise distances, cross-validation scheduling, permutation importance, supported tree/neighbour models, PyTorch CPU pools and native BLAS/OpenMP libraries, but it avoids obvious nested oversubscription in cross-validation workflows.
+
+
+## Synthetic latent benchmark
+
+CPATK includes a controlled synthetic benchmark for the CPATK-native contrastive
+latent backend:
+
+```bash
+cpatk-synthetic-latent-benchmark \
+  --output_dir cpatk_synthetic_latent_benchmark \
+  --threads 16
+```
+
+The benchmark generates Cell Painting-like profiles with known compound, MOA,
+dataset and batch structure. It compares raw feature-space retrieval, PCA and
+CPATK-native contrastive retrieval across clean, batch-confounded, weak-biology
+and no-biology negative-control scenarios. The main outputs are
+`synthetic_metric_summary.tsv`, `synthetic_pass_fail_summary.tsv` and the
+per-scenario latent/neighbour tables.
