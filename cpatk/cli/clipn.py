@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from cpatk.clipn_adapter import (
@@ -78,8 +79,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--native_eval_batches", type=int, default=4)
     parser.add_argument("--native_steps_per_epoch", type=int, default=0, help="Sampled training mini-batches per epoch for cpatk_contrastive. Use 0 for automatic sizing from training rows and batch size.")
     parser.add_argument("--native_device", default="auto", help="auto, cpu, cuda, or a specific torch device such as cuda:0.")
-    parser.add_argument("--threads", type=int, default=1, help="Thread count for supported CPU/native-library operations. GPU training still uses the selected CUDA device.")
+    parser.add_argument("--threads", type=int, default=int(os.environ.get("NSLOTS", os.environ.get("THREADS", "1"))), help="Thread count for supported CPU/native-library operations. GPU training still uses the selected CUDA device.")
     parser.add_argument("--native_encode_chunk_size", type=int, default=32768)
+    parser.add_argument(
+        "--run_compound_holdout_validation",
+        action="store_true",
+        help=(
+            "Run repeated CPATK-native contrastive validation where whole compounds/positive groups "
+            "are excluded from training, then encoded and evaluated for held-out replicate cohesion. "
+            "This is stricter than ordinary row-level validation and only applies to cpatk_contrastive."
+        ),
+    )
+    parser.add_argument("--compound_holdout_column", default=None, help="Positive/group column to hold out. Defaults to --native_positive_column or --id_column.")
+    parser.add_argument("--compound_holdout_fraction", type=float, default=0.20)
+    parser.add_argument("--compound_holdout_repeats", type=int, default=5)
+    parser.add_argument("--compound_holdout_seed", type=int, default=42)
+    parser.add_argument("--compound_holdout_min_profiles", type=int, default=4, help="Minimum profiles required for a compound/group to be eligible for whole-group holdout.")
     parser.add_argument(
         "--imputation_method",
         choices=["none", "median", "mean", "knn"],
@@ -300,6 +315,12 @@ def main() -> None:
         native_steps_per_epoch=(None if args.native_steps_per_epoch <= 0 else args.native_steps_per_epoch),
         native_device=args.native_device,
         native_encode_chunk_size=args.native_encode_chunk_size,
+        run_compound_holdout_validation=args.run_compound_holdout_validation,
+        compound_holdout_column=args.compound_holdout_column,
+        compound_holdout_fraction=args.compound_holdout_fraction,
+        compound_holdout_repeats=args.compound_holdout_repeats,
+        compound_holdout_seed=args.compound_holdout_seed,
+        compound_holdout_min_profiles=args.compound_holdout_min_profiles,
         n_threads=threads,
     )
     run_clipn_workflow(

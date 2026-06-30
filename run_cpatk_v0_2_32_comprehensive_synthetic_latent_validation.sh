@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #$ -jc rhel9
 #$ -j y
-#$ -N cpatk_synth_v031
+#$ -N cpatk_synth_v032
 #$ -jc long
 #$ -pe smp 16
 #$ -mods l_hard mfree 96G
@@ -12,7 +12,7 @@
 ##$ -adds l_hard gpu 1
 ##$ -adds l_hard cuda.0.name 'NVIDIA A40'
 
-# CPATK v0.2.31 comprehensive synthetic latent validation.
+# CPATK v0.2.32 comprehensive synthetic latent validation.
 # This is deliberately more demanding than the v0.2.30 smoke benchmark. It runs
 # repeated random seeds across clean, weak, confounded, noisy-label, missingness,
 # missing-compartment, outlier and negative-control scenarios. The primary metric
@@ -23,13 +23,13 @@ IFS=$'\n\t'
 
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 BASE_DIR="${BASE_DIR:-/home/${USER}/data/2025_jason_cell_painting/data/cpatk_synthetic_benchmarks}"
-OUT_DIR="${OUT_DIR:-${BASE_DIR}/cpatk_v0_2_31_comprehensive_synthetic_latent_${RUN_TAG}}"
+OUT_DIR="${OUT_DIR:-${BASE_DIR}/cpatk_v0_2_32_comprehensive_synthetic_latent_${RUN_TAG}}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-cpatk}"
 THREADS="${THREADS:-${NSLOTS:-16}}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
 BENCHMARK_MODE="${BENCHMARK_MODE:-comprehensive}"
-# Leave SCENARIOS empty to use the v0.2.31 comprehensive preset.
+# Leave SCENARIOS empty to use the v0.2.32 comprehensive preset.
 SCENARIOS="${SCENARIOS:-}"
 SEED_VALUES="${SEED_VALUES:-42,101,202,303,404}"
 N_COMPOUNDS="${N_COMPOUNDS:-48}"
@@ -93,7 +93,7 @@ mkdir -p "${OUT_DIR}"
   printf 'out_dir\t%s\n' "${OUT_DIR}"
   printf 'threads\t%s\n' "${THREADS}"
   printf 'benchmark_mode\t%s\n' "${BENCHMARK_MODE}"
-  printf 'scenarios\t%s\n' "${SCENARIOS:-v0.2.31_comprehensive_preset}"
+  printf 'scenarios\t%s\n' "${SCENARIOS:-v0.2.32_comprehensive_preset}"
   printf 'seed_values\t%s\n' "${SEED_VALUES}"
   printf 'n_compounds\t%s\n' "${N_COMPOUNDS}"
   printf 'n_moa_classes\t%s\n' "${N_MOA_CLASSES}"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from cpatk.synthetic_latent import (
@@ -71,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.10)
     parser.add_argument("--random_state", type=int, default=42)
     parser.add_argument("--n_neighbours", type=int, default=5)
-    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--threads", type=int, default=int(os.environ.get("NSLOTS", os.environ.get("THREADS", "1"))))
     parser.add_argument("--skip_native_contrastive", action="store_true")
     parser.add_argument("--skip_pca", action="store_true")
     parser.add_argument("--log_level", default="INFO")

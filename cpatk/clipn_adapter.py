@@ -211,6 +211,12 @@ class ClipnAdapterConfig:
     native_steps_per_epoch: Optional[int] = None
     native_device: str = "auto"
     native_encode_chunk_size: int = 32768
+    run_compound_holdout_validation: bool = False
+    compound_holdout_column: Optional[str] = None
+    compound_holdout_fraction: float = 0.20
+    compound_holdout_repeats: int = 5
+    compound_holdout_seed: int = 42
+    compound_holdout_min_profiles: int = 4
     n_threads: int = 1
 
 
@@ -1181,7 +1187,11 @@ def _fit_clipn_with_training_policy(
 
 
 
-def _native_config_from_clipn_config(*, config: ClipnAdapterConfig) -> NativeContrastiveConfig:
+def _native_config_from_clipn_config(
+    *,
+    config: ClipnAdapterConfig,
+    heldout_positive_values: Optional[Sequence[str]] = None,
+) -> NativeContrastiveConfig:
     """Translate the shared adapter config into native contrastive config."""
     return NativeContrastiveConfig(
         latent_dim=int(config.latent_dim),
@@ -1210,6 +1220,7 @@ def _native_config_from_clipn_config(*, config: ClipnAdapterConfig) -> NativeCon
         normalise_latent=bool(config.normalise_latent),
         encode_chunk_size=int(config.native_encode_chunk_size),
         n_threads=int(config.n_threads),
+        heldout_positive_values=[str(value) for value in (heldout_positive_values or [])],
     )
 
 
@@ -1505,6 +1516,72 @@ def diagnose_latent_space_quality(
     return pd.DataFrame.from_records(records)
 
 
+
+
+def diagnose_feature_alignment_quality(*, feature_summary: pd.DataFrame) -> pd.DataFrame:
+    """Warn when shared-feature alignment suggests missing compartments/blocks.
+
+    The native contrastive backend can be useful under ordinary batch effects,
+    but the v0.2.31 synthetic validation showed that source-linked missing
+    compartments are a serious failure mode. This diagnostic flags cases where
+    the shared feature intersection is a small fraction of the feature union or
+    where one dataset contributes many fewer candidate features than another.
+    """
+    if feature_summary is None or feature_summary.empty:
+        return pd.DataFrame.from_records(
+            [
+                {
+                    "severity": "info",
+                    "diagnostic": "no_feature_alignment_summary",
+                    "message": "No feature-alignment summary was available.",
+                }
+            ]
+        )
+    records = []
+    frame = feature_summary.copy()
+    for column in ["n_candidate_features", "n_shared_features", "n_missing_from_union"]:
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if {"n_candidate_features", "n_shared_features", "n_missing_from_union"}.issubset(frame.columns):
+        union_estimates = frame["n_candidate_features"] + frame["n_missing_from_union"]
+        union_size = float(np.nanmax(union_estimates)) if not union_estimates.empty else float("nan")
+        shared_size = float(np.nanmax(frame["n_shared_features"])) if "n_shared_features" in frame.columns else float("nan")
+        retained_fraction = shared_size / union_size if np.isfinite(union_size) and union_size > 0 else float("nan")
+        max_missing_fraction = float(np.nanmax(frame["n_missing_from_union"] / union_estimates.replace(0, np.nan)))
+        if np.isfinite(retained_fraction) and retained_fraction < 0.70:
+            records.append(
+                {
+                    "severity": "warning",
+                    "diagnostic": "low_shared_feature_fraction",
+                    "value": retained_fraction,
+                    "message": (
+                        "The shared feature intersection is less than 70% of the apparent feature union. "
+                        "This can indicate missing compartments or source-specific feature blocks, which are a known risk for latent contrastive learning."
+                    ),
+                }
+            )
+        if np.isfinite(max_missing_fraction) and max_missing_fraction > 0.20:
+            records.append(
+                {
+                    "severity": "warning",
+                    "diagnostic": "source_linked_missing_feature_blocks",
+                    "value": max_missing_fraction,
+                    "message": (
+                        "At least one dataset is missing more than 20% of the apparent feature union. "
+                        "Check whether compartments/features are source-linked before interpreting the latent space."
+                    ),
+                }
+            )
+    if not records:
+        records.append(
+            {
+                "severity": "info",
+                "diagnostic": "feature_alignment_no_major_warning",
+                "message": "No major shared-feature alignment warning was triggered.",
+            }
+        )
+    return pd.DataFrame.from_records(records)
+
 def make_latent_backend_policy_table(*, config: ClipnAdapterConfig) -> pd.DataFrame:
     """Return a one-row table explaining the latent backend selection policy."""
     backend = str(config.backend_module)
@@ -1663,6 +1740,350 @@ def diagnose_training_curve(*, loss_table: pd.DataFrame, backend_module: str) ->
             )
     return pd.DataFrame.from_records(records)
 
+
+
+def _first_present_column(*, table: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+    """Return the first candidate column present in a table."""
+    for column in candidates:
+        if column in table.columns:
+            return str(column)
+    return None
+
+
+def _safe_boolean_rate(values: pd.Series) -> float:
+    """Return the mean of a boolean series, or NaN when unavailable."""
+    if values is None or values.empty:
+        return float("nan")
+    return float(values.astype(bool).mean())
+
+
+def calculate_compound_holdout_embedding_metrics(
+    *,
+    latent_table: pd.DataFrame,
+    holdout_values: Sequence[str],
+    holdout_column: str,
+    label_column: str,
+    distance_metric: str = "cosine",
+    threads: int = 1,
+    repeat_index: int = 1,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Evaluate a latent table from a whole-compound holdout fit.
+
+    Whole-compound holdout asks a stricter question than ordinary row-level
+    validation. The held-out compounds are excluded from supervised training,
+    then encoded by the trained model. Because those compound labels are absent
+    from the training set, same-compound retrieval against the training set is
+    impossible. Instead this function reports whether held-out replicates still
+    cohere with one another, and whether held-out profiles retrieve similar
+    labels/classes from the training set when such labels are available.
+    """
+    require_sklearn_stack(purpose="compound-holdout latent validation")
+    latent_columns = [column for column in latent_table.columns if str(column).startswith("latent_")]
+    if not latent_columns:
+        return (
+            pd.DataFrame.from_records(
+                [
+                    {
+                        "repeat": int(repeat_index),
+                        "metric": "compound_holdout_status",
+                        "value": np.nan,
+                        "message": "No latent columns were available.",
+                    }
+                ]
+            ),
+            pd.DataFrame(),
+        )
+    if holdout_column not in latent_table.columns:
+        return (
+            pd.DataFrame.from_records(
+                [
+                    {
+                        "repeat": int(repeat_index),
+                        "metric": "compound_holdout_status",
+                        "value": np.nan,
+                        "message": f"Holdout column is missing from latent table: {holdout_column}",
+                    }
+                ]
+            ),
+            pd.DataFrame(),
+        )
+    holdout_set = {str(value) for value in holdout_values}
+    group_values = latent_table[holdout_column].fillna("missing").astype(str)
+    holdout_mask = group_values.isin(holdout_set).to_numpy(dtype=bool)
+    train_mask = ~holdout_mask
+    batch_column = _first_present_column(
+        table=latent_table,
+        candidates=["Metadata_Plate", "Plate_Metadata", "synthetic_batch", "Batch", "Dataset"],
+    )
+    label_column = label_column if label_column in latent_table.columns else ""
+    X = latent_table.loc[:, latent_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    records = [
+        {"repeat": int(repeat_index), "metric": "n_holdout_groups", "value": float(len(holdout_set))},
+        {"repeat": int(repeat_index), "metric": "n_holdout_rows", "value": float(holdout_mask.sum())},
+        {"repeat": int(repeat_index), "metric": "n_training_rows", "value": float(train_mask.sum())},
+    ]
+    neighbour_rows = []
+    if int(holdout_mask.sum()) >= 3:
+        holdout_indices = np.where(holdout_mask)[0]
+        nn_model = NearestNeighbors(
+            n_neighbors=2,
+            metric=distance_metric,
+            n_jobs=max(1, int(threads)),
+        )
+        nn_model.fit(X.iloc[holdout_indices, :])
+        distances, local_indices = nn_model.kneighbors(X.iloc[holdout_indices, :], return_distance=True)
+        rows = []
+        for query_pos, query_index in enumerate(holdout_indices):
+            neighbour_index = int(holdout_indices[int(local_indices[query_pos, 1])])
+            row = {
+                "repeat": int(repeat_index),
+                "comparison": "heldout_internal",
+                "query_index": int(query_index),
+                "neighbour_index": neighbour_index,
+                "distance": float(distances[query_pos, 1]),
+                "Query_holdout_group": latent_table.iloc[query_index].get(holdout_column),
+                "Neighbour_holdout_group": latent_table.iloc[neighbour_index].get(holdout_column),
+            }
+            row["same_holdout_group"] = bool(str(row["Query_holdout_group"]) == str(row["Neighbour_holdout_group"]))
+            if label_column:
+                row["Query_label"] = latent_table.iloc[query_index].get(label_column)
+                row["Neighbour_label"] = latent_table.iloc[neighbour_index].get(label_column)
+                row["same_label"] = bool(str(row["Query_label"]) == str(row["Neighbour_label"]))
+            if "Dataset" in latent_table.columns:
+                row["Query_Dataset"] = latent_table.iloc[query_index].get("Dataset")
+                row["Neighbour_Dataset"] = latent_table.iloc[neighbour_index].get("Dataset")
+                row["same_dataset"] = bool(str(row["Query_Dataset"]) == str(row["Neighbour_Dataset"]))
+            if batch_column:
+                row["Query_batch"] = latent_table.iloc[query_index].get(batch_column)
+                row["Neighbour_batch"] = latent_table.iloc[neighbour_index].get(batch_column)
+                row["same_batch"] = bool(str(row["Query_batch"]) == str(row["Neighbour_batch"]))
+            rows.append(row)
+        internal = pd.DataFrame.from_records(rows)
+        neighbour_rows.append(internal)
+        records.extend(
+            [
+                {
+                    "repeat": int(repeat_index),
+                    "metric": "heldout_internal_top1_same_compound_rate",
+                    "value": _safe_boolean_rate(internal.get("same_holdout_group", pd.Series(dtype=bool))),
+                },
+                {
+                    "repeat": int(repeat_index),
+                    "metric": "heldout_internal_top1_same_label_rate",
+                    "value": _safe_boolean_rate(internal.get("same_label", pd.Series(dtype=bool))),
+                },
+                {
+                    "repeat": int(repeat_index),
+                    "metric": "heldout_internal_top1_same_dataset_rate",
+                    "value": _safe_boolean_rate(internal.get("same_dataset", pd.Series(dtype=bool))),
+                },
+                {
+                    "repeat": int(repeat_index),
+                    "metric": "heldout_internal_top1_same_batch_rate",
+                    "value": _safe_boolean_rate(internal.get("same_batch", pd.Series(dtype=bool))),
+                },
+            ]
+        )
+    else:
+        records.append(
+            {
+                "repeat": int(repeat_index),
+                "metric": "heldout_internal_status",
+                "value": np.nan,
+                "message": "Fewer than three held-out rows were available for internal nearest-neighbour validation.",
+            }
+        )
+    if int(holdout_mask.sum()) >= 1 and int(train_mask.sum()) >= 2:
+        train_indices = np.where(train_mask)[0]
+        holdout_indices = np.where(holdout_mask)[0]
+        nn_model = NearestNeighbors(
+            n_neighbors=1,
+            metric=distance_metric,
+            n_jobs=max(1, int(threads)),
+        )
+        nn_model.fit(X.iloc[train_indices, :])
+        distances, local_indices = nn_model.kneighbors(X.iloc[holdout_indices, :], return_distance=True)
+        rows = []
+        for query_pos, query_index in enumerate(holdout_indices):
+            neighbour_index = int(train_indices[int(local_indices[query_pos, 0])])
+            row = {
+                "repeat": int(repeat_index),
+                "comparison": "heldout_to_train",
+                "query_index": int(query_index),
+                "neighbour_index": neighbour_index,
+                "distance": float(distances[query_pos, 0]),
+                "Query_holdout_group": latent_table.iloc[query_index].get(holdout_column),
+                "Neighbour_holdout_group": latent_table.iloc[neighbour_index].get(holdout_column),
+                "same_holdout_group": False,
+            }
+            if label_column:
+                row["Query_label"] = latent_table.iloc[query_index].get(label_column)
+                row["Neighbour_label"] = latent_table.iloc[neighbour_index].get(label_column)
+                row["same_label"] = bool(str(row["Query_label"]) == str(row["Neighbour_label"]))
+            if "Dataset" in latent_table.columns:
+                row["Query_Dataset"] = latent_table.iloc[query_index].get("Dataset")
+                row["Neighbour_Dataset"] = latent_table.iloc[neighbour_index].get("Dataset")
+                row["same_dataset"] = bool(str(row["Query_Dataset"]) == str(row["Neighbour_Dataset"]))
+            if batch_column:
+                row["Query_batch"] = latent_table.iloc[query_index].get(batch_column)
+                row["Neighbour_batch"] = latent_table.iloc[neighbour_index].get(batch_column)
+                row["same_batch"] = bool(str(row["Query_batch"]) == str(row["Neighbour_batch"]))
+            rows.append(row)
+        to_train = pd.DataFrame.from_records(rows)
+        neighbour_rows.append(to_train)
+        records.extend(
+            [
+                {
+                    "repeat": int(repeat_index),
+                    "metric": "heldout_to_train_top1_same_label_rate",
+                    "value": _safe_boolean_rate(to_train.get("same_label", pd.Series(dtype=bool))),
+                },
+                {
+                    "repeat": int(repeat_index),
+                    "metric": "heldout_to_train_top1_same_dataset_rate",
+                    "value": _safe_boolean_rate(to_train.get("same_dataset", pd.Series(dtype=bool))),
+                },
+                {
+                    "repeat": int(repeat_index),
+                    "metric": "heldout_to_train_top1_same_batch_rate",
+                    "value": _safe_boolean_rate(to_train.get("same_batch", pd.Series(dtype=bool))),
+                },
+                {
+                    "repeat": int(repeat_index),
+                    "metric": "heldout_to_train_mean_distance",
+                    "value": float(to_train["distance"].mean()) if "distance" in to_train.columns else np.nan,
+                },
+            ]
+        )
+    neighbours = pd.concat(neighbour_rows, ignore_index=True, sort=False) if neighbour_rows else pd.DataFrame()
+    return pd.DataFrame.from_records(records), neighbours
+
+
+def run_native_compound_holdout_validation(
+    *,
+    cleaned: Mapping[str, pd.DataFrame],
+    metadata: pd.DataFrame,
+    config: ClipnAdapterConfig,
+    logger: Optional[logging.Logger] = None,
+) -> dict[str, pd.DataFrame]:
+    """Run repeated whole-compound holdout validation for the native backend."""
+    if str(config.backend_module).lower() not in {"cpatk_contrastive", "native_contrastive"}:
+        return {
+            "compound_holdout_validation_summary": pd.DataFrame.from_records(
+                [
+                    {
+                        "repeat": 0,
+                        "metric": "compound_holdout_status",
+                        "value": np.nan,
+                        "message": "Compound holdout validation is only implemented for cpatk_contrastive.",
+                    }
+                ]
+            )
+        }
+    holdout_column = str(config.compound_holdout_column or config.native_positive_column or config.id_column)
+    if holdout_column not in metadata.columns:
+        return {
+            "compound_holdout_validation_summary": pd.DataFrame.from_records(
+                [
+                    {
+                        "repeat": 0,
+                        "metric": "compound_holdout_status",
+                        "value": np.nan,
+                        "message": f"Holdout column missing from metadata: {holdout_column}",
+                    }
+                ]
+            )
+        }
+    values = metadata[holdout_column].fillna("missing").astype(str)
+    counts = values.value_counts(dropna=False)
+    eligible = counts[counts >= int(max(2, config.compound_holdout_min_profiles))].index.astype(str).tolist()
+    group_report = counts.rename_axis("holdout_group").reset_index(name="n_profiles")
+    group_report["eligible_for_holdout"] = group_report["holdout_group"].astype(str).isin(set(eligible))
+    if len(eligible) < 3:
+        return {
+            "compound_holdout_validation_group_report": group_report,
+            "compound_holdout_validation_summary": pd.DataFrame.from_records(
+                [
+                    {
+                        "repeat": 0,
+                        "metric": "compound_holdout_status",
+                        "value": np.nan,
+                        "message": "Fewer than three eligible repeated compounds/groups were available for whole-group holdout.",
+                    }
+                ]
+            ),
+        }
+    rng = np.random.default_rng(seed=int(config.compound_holdout_seed))
+    fraction = min(max(float(config.compound_holdout_fraction), 0.01), 0.80)
+    n_holdout = int(round(len(eligible) * fraction))
+    n_holdout = min(max(1, n_holdout), len(eligible) - 2)
+    summary_tables = []
+    neighbour_tables = []
+    training_tables = []
+    split_tables = []
+    selection_rows = []
+    for repeat_index in range(1, int(max(1, config.compound_holdout_repeats)) + 1):
+        heldout_values = sorted(rng.choice(np.asarray(eligible, dtype=object), size=n_holdout, replace=False).astype(str).tolist())
+        if logger is not None:
+            logger.info(
+                "Running native compound holdout validation repeat %d/%d with %d held-out groups.",
+                repeat_index,
+                int(max(1, config.compound_holdout_repeats)),
+                len(heldout_values),
+            )
+        native_config = _native_config_from_clipn_config(
+            config=config,
+            heldout_positive_values=heldout_values,
+        )
+        native_config.random_state = int(config.compound_holdout_seed) + int(repeat_index)
+        result = fit_native_contrastive_backend(
+            cleaned=cleaned,
+            metadata=metadata,
+            config=native_config,
+            logger=logger,
+        )
+        summary, neighbours = calculate_compound_holdout_embedding_metrics(
+            latent_table=result.latent_table,
+            holdout_values=heldout_values,
+            holdout_column=holdout_column,
+            label_column=config.label_column,
+            distance_metric=config.distance_metric,
+            threads=int(config.n_threads),
+            repeat_index=repeat_index,
+        )
+        summary.insert(1, "holdout_column", holdout_column)
+        summary.insert(2, "n_eligible_holdout_groups", int(len(eligible)))
+        summary_tables.append(summary)
+        if not neighbours.empty:
+            neighbour_tables.append(neighbours)
+        train = result.training_summary.copy()
+        train.insert(0, "repeat", int(repeat_index))
+        training_tables.append(train)
+        split = result.split_report.copy()
+        split.insert(0, "repeat", int(repeat_index))
+        split_tables.append(split)
+        for value in heldout_values:
+            selection_rows.append(
+                {
+                    "repeat": int(repeat_index),
+                    "holdout_column": holdout_column,
+                    "heldout_group": value,
+                    "n_profiles": int(counts.get(value, 0)),
+                }
+            )
+    outputs = {
+        "compound_holdout_validation_group_report": group_report,
+        "compound_holdout_validation_selection_report": pd.DataFrame.from_records(selection_rows),
+        "compound_holdout_validation_summary": pd.concat(summary_tables, ignore_index=True, sort=False),
+    }
+    if neighbour_tables:
+        outputs["compound_holdout_validation_neighbours"] = pd.concat(neighbour_tables, ignore_index=True, sort=False)
+    if training_tables:
+        outputs["compound_holdout_validation_training_summary"] = pd.concat(training_tables, ignore_index=True, sort=False)
+    if split_tables:
+        outputs["compound_holdout_validation_split_report"] = pd.concat(split_tables, ignore_index=True, sort=False)
+    return outputs
+
 def run_clipn_workflow(
     *,
     datasets: Mapping[str, pd.DataFrame],
@@ -1689,11 +2110,13 @@ def run_clipn_workflow(
     )
     labels, label_encoder, label_report = encode_labels_for_clipn(datasets=datasets, config=config)
     status = check_clipn_backend(backend_module=config.backend_module)
+    feature_alignment_warnings = diagnose_feature_alignment_quality(feature_summary=feature_summary)
     output_tables: dict[str, pd.DataFrame] = {
         "latent_backend_policy": make_latent_backend_policy_table(config=config),
         "clipn_status": status,
         "clipn_feature_summary": feature_summary,
         "clipn_feature_report": feature_report,
+        "clipn_feature_alignment_warnings": feature_alignment_warnings,
         "clipn_preprocessing_summary": preprocessing_summary,
         "clipn_label_report": label_report,
     }
@@ -1701,7 +2124,9 @@ def run_clipn_workflow(
     model: object | None = None
     loss_table = pd.DataFrame()
     training_summary = pd.DataFrame()
-    warnings = []
+    warnings = feature_alignment_warnings.loc[
+        feature_alignment_warnings["severity"].eq("warning"), "message"
+    ].astype(str).tolist()
     if bool(status["available"].iloc[0]):
         try:
             if str(config.backend_module).lower() in {"cpatk_contrastive", "native_contrastive"}:
@@ -1774,6 +2199,51 @@ def run_clipn_workflow(
         loss_table=loss_table,
         training_summary=training_summary,
     )
+    if (
+        bool(config.run_compound_holdout_validation)
+        and str(config.backend_module).lower() in {"cpatk_contrastive", "native_contrastive"}
+        and str(run_status["backend_run"].iloc[0]) == "success"
+    ):
+        try:
+            holdout_tables = run_native_compound_holdout_validation(
+                cleaned=cleaned,
+                metadata=metadata,
+                config=config,
+                logger=logger,
+            )
+            output_tables.update(holdout_tables)
+            holdout_summary = holdout_tables.get("compound_holdout_validation_summary", pd.DataFrame())
+            if not holdout_summary.empty:
+                low_internal = holdout_summary.loc[
+                    holdout_summary["metric"].eq("heldout_internal_top1_same_compound_rate")
+                    & (pd.to_numeric(holdout_summary["value"], errors="coerce") < 0.25)
+                ]
+                high_leakage = holdout_summary.loc[
+                    holdout_summary["metric"].isin(
+                        [
+                            "heldout_internal_top1_same_dataset_rate",
+                            "heldout_to_train_top1_same_dataset_rate",
+                        ]
+                    )
+                    & (pd.to_numeric(holdout_summary["value"], errors="coerce") > 0.80)
+                ]
+                if not low_internal.empty:
+                    warnings.append(
+                        "Whole-compound holdout validation found weak held-out replicate cohesion. "
+                        "Treat the latent space cautiously for unseen compounds."
+                    )
+                if not high_leakage.empty:
+                    warnings.append(
+                        "Whole-compound holdout validation showed high same-dataset/source retrieval. "
+                        "This suggests residual batch/source structure in held-out compounds."
+                    )
+        except Exception as exc:
+            if logger is not None:
+                logger.exception("Compound holdout validation failed.")
+            warnings.append(f"Compound holdout validation failed: {exc}")
+            output_tables["compound_holdout_validation_summary"] = pd.DataFrame.from_records(
+                [{"repeat": 0, "metric": "compound_holdout_status", "value": np.nan, "message": str(exc)}]
+            )
     if not latent_table.empty:
         output_tables["clipn_latent"] = latent_table
         if not loss_table.empty:

@@ -57,6 +57,7 @@ class NativeContrastiveConfig:
     normalise_latent: bool = True
     encode_chunk_size: int = 32768
     n_threads: int = 1
+    heldout_positive_values: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -520,11 +521,45 @@ def fit_native_contrastive_backend(
     if usable_profile_count < 2:
         raise ValueError("Fewer than two profiles are available for contrastive training.")
 
-    train_mask, val_mask, split_report = make_stratified_validation_split(
-        labels=labels,
-        validation_fraction=float(config.validation_fraction),
-        random_state=int(config.random_state),
-    )
+    eligible_training_mask = np.ones(labels.shape[0], dtype=bool)
+    heldout_values = {str(value) for value in getattr(config, "heldout_positive_values", [])}
+    if heldout_values:
+        if str(config.positive_column) not in metadata_aligned.columns:
+            raise ValueError(
+                "The configured positive column is missing from aligned metadata: "
+                f"{config.positive_column}"
+            )
+        positive_strings = metadata_aligned[str(config.positive_column)].fillna("missing").astype(str).to_numpy()
+        eligible_training_mask = np.asarray(
+            [value not in heldout_values for value in positive_strings],
+            dtype=bool,
+        )
+        if int(eligible_training_mask.sum()) < 2:
+            raise ValueError(
+                "Compound-holdout native contrastive training left fewer than two "
+                "training profiles. Reduce the holdout fraction."
+            )
+
+    if bool(eligible_training_mask.all()):
+        train_mask, val_mask, split_report = make_stratified_validation_split(
+            labels=labels,
+            validation_fraction=float(config.validation_fraction),
+            random_state=int(config.random_state),
+        )
+    else:
+        eligible_indices = np.where(eligible_training_mask)[0]
+        local_train_mask, local_val_mask, local_split_report = make_stratified_validation_split(
+            labels=labels[eligible_indices],
+            validation_fraction=float(config.validation_fraction),
+            random_state=int(config.random_state),
+        )
+        train_mask = np.zeros(labels.shape[0], dtype=bool)
+        val_mask = np.zeros(labels.shape[0], dtype=bool)
+        train_mask[eligible_indices[local_train_mask]] = True
+        val_mask[eligible_indices[local_val_mask]] = True
+        split_report = local_split_report.copy()
+        split_report.insert(0, "heldout_positive_values", ";".join(sorted(heldout_values)))
+        split_report.insert(1, "n_profiles_excluded_from_training", int((~eligible_training_mask).sum()))
     train_indices = np.where(train_mask)[0]
     val_indices = np.where(val_mask)[0]
     if not _usable_positive_groups(labels=labels, indices=train_indices):
@@ -680,6 +715,8 @@ def fit_native_contrastive_backend(
                 "n_positive_labels": int(label_report.shape[0]),
                 "n_repeated_positive_labels": usable_label_count,
                 "n_profiles_in_repeated_positive_labels": usable_profile_count,
+                "n_profiles_excluded_from_training_holdout": int((~eligible_training_mask).sum()),
+                "n_heldout_positive_values": int(len(heldout_values)),
                 "latent_dim": int(config.latent_dim),
                 "hidden_dims": ";".join(map(str, config.hidden_dims)),
                 "activation": str(config.activation),

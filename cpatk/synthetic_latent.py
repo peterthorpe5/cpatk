@@ -1440,10 +1440,11 @@ def score_synthetic_scenario(
         metric="validation_to_train_top1_same_batch_rate",
     )
     overfit_gap = native_top1_all - native_top1_validation
-    if scenario_name == "no_biology_negative_control":
+    if "no_biology" in str(scenario_name):
         passed = bool(np.isnan(native_top1_validation) or native_top1_validation < 0.10)
         message = (
-            "Negative control should not show held-out compound retrieval when no biology was simulated."
+            "No-biology negative-control scenarios should not show held-out compound retrieval. "
+            "High dataset or batch retrieval is still reported separately as leakage."
         )
     elif scenario_name == "weak_biology":
         passed = bool(np.isfinite(native_top1_validation) and native_top1_validation >= 0.15)
@@ -1504,11 +1505,16 @@ def score_synthetic_scenario(
             ),
         }
     )
-    leakage_passed = bool(
-        not np.isfinite(native_dataset_validation)
-        or native_dataset_validation <= 0.90
-        or scenario_name == "no_biology_negative_control"
-    )
+    if "no_biology" in str(scenario_name):
+        leakage_passed = bool(
+            not np.isfinite(native_dataset_validation)
+            or native_dataset_validation <= 0.85
+        )
+    else:
+        leakage_passed = bool(
+            not np.isfinite(native_dataset_validation)
+            or native_dataset_validation <= 0.90
+        )
     rows.append(
         {
             "scenario": scenario_name,
@@ -1531,6 +1537,24 @@ def score_synthetic_scenario(
             "message": "Held-out batch leakage is recorded as a diagnostic rather than a hard failure in synthetic stress tests.",
         }
     )
+    if str(scenario_name) == "missing_compartment":
+        rows.append(
+            {
+                "scenario": scenario_name,
+                "check": "missing_compartment_not_source_dominated",
+                "passed": bool(
+                    (not np.isfinite(native_dataset_validation) or native_dataset_validation <= 0.85)
+                    and (not np.isfinite(native_top1_validation) or not np.isfinite(raw_top1_validation) or native_top1_validation >= (raw_top1_validation - 0.05))
+                ),
+                "value": native_dataset_validation,
+                "comparison_pca": pca_top1_validation,
+                "comparison_raw": raw_top1_validation,
+                "message": (
+                    "Missing-compartment scenarios should not collapse into dataset/source structure, "
+                    "and native retrieval should not substantially underperform raw features."
+                ),
+            }
+        )
     return pd.DataFrame.from_records(rows)
 
 
@@ -1603,8 +1627,18 @@ def summarise_comprehensive_validation(
             continue
         if "no_biology" in str(scenario):
             target = 0.10
-            decision = "pass" if _safe_nanmean(native_top) <= target else "fail"
-            message = "Negative-control held-out compound retrieval should stay near random."
+            mean_dataset_leakage = _safe_nanmean(_series_or_nan(frame=native, column=dataset_col))
+            mean_batch_leakage = _safe_nanmean(_series_or_nan(frame=native, column=batch_col))
+            if _safe_nanmean(native_top) > target:
+                decision = "fail"
+            elif mean_dataset_leakage > 0.85 or mean_batch_leakage > 0.85:
+                decision = "warn"
+            else:
+                decision = "pass"
+            message = (
+                "Negative-control held-out compound retrieval should stay near random; "
+                "high dataset/batch leakage is a warning even when compound retrieval is low."
+            )
         elif str(scenario) in {"weak_biology", "label_noise_25pct", "high_missingness", "missing_compartment", "segmentation_outliers"}:
             target = 0.15
             decision = "pass" if _safe_nanmean(native_top) >= target else "warn"
