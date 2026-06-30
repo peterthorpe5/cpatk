@@ -562,6 +562,197 @@ def calculate_embedding_retrieval_metrics(
     return pd.DataFrame.from_records(records), neighbours
 
 
+
+def calculate_validation_to_train_retrieval_metrics(
+    *,
+    embedding: pd.DataFrame,
+    id_column: str = "cpd_id",
+    label_column: str = "cpd_type",
+    dataset_column: str = "Dataset",
+    batch_column: str = "synthetic_batch",
+    split_column: str = "cpd_id",
+    validation_fraction: float = 0.15,
+    random_state: int = 42,
+    n_neighbours: int = 5,
+    metric: str = "cosine",
+    threads: int = 1,
+    method_name: str = "embedding",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Calculate validation-to-train retrieval metrics for an embedding.
+
+    This deliberately avoids ordinary all-row nearest-neighbour metrics, where
+    training rows can be nearest to other training rows.  For supervised latent
+    methods, all-row metrics can look good even when the model has overfit label
+    structure.  The validation-to-train view asks whether held-out profiles find
+    matching training profiles in the learned space.
+    """
+    require_sklearn_for_synthetic(purpose="validation-to-train retrieval metrics")
+    latent_columns = _numeric_embedding_columns(embedding=embedding)
+    if len(latent_columns) < 1 or split_column not in embedding.columns:
+        status = pd.DataFrame.from_records(
+            [
+                {
+                    "method": method_name,
+                    "metric": "validation_to_train_status",
+                    "value": np.nan,
+                    "message": "Insufficient embedding columns or missing split column.",
+                }
+            ]
+        )
+        return status, pd.DataFrame(), pd.DataFrame()
+
+    train_mask, validation_mask, split_report = make_label_stratified_row_split(
+        labels=embedding[split_column].fillna("missing").astype(str).to_numpy(),
+        validation_fraction=float(validation_fraction),
+        random_state=int(random_state),
+    )
+    if int(train_mask.sum()) < 2 or int(validation_mask.sum()) < 1:
+        status = pd.DataFrame.from_records(
+            [
+                {
+                    "method": method_name,
+                    "metric": "validation_to_train_status",
+                    "value": np.nan,
+                    "message": "Insufficient train/validation rows for retrieval.",
+                }
+            ]
+        )
+        return status, pd.DataFrame(), split_report
+
+    X = embedding.loc[:, latent_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    train_indices = np.where(train_mask)[0]
+    validation_indices = np.where(validation_mask)[0]
+    n_query_neighbours = min(int(max(1, n_neighbours)), int(train_indices.shape[0]))
+    nn_model = NearestNeighbors(
+        n_neighbors=n_query_neighbours,
+        metric=metric,
+        n_jobs=max(1, int(threads)),
+    )
+    nn_model.fit(X.iloc[train_indices, :])
+    distances, local_indices = nn_model.kneighbors(
+        X.iloc[validation_indices, :],
+        return_distance=True,
+    )
+    rows = []
+    for query_position, query_index in enumerate(validation_indices):
+        for rank_index, (local_index, distance) in enumerate(
+            zip(local_indices[query_position], distances[query_position]),
+            start=1,
+        ):
+            neighbour_index = int(train_indices[int(local_index)])
+            row = {
+                "method": method_name,
+                "query_index": int(query_index),
+                "neighbour_index": neighbour_index,
+                "query_split": "validation",
+                "neighbour_split": "train",
+                "rank": int(rank_index),
+                "distance": float(distance),
+            }
+            for column in [id_column, label_column, dataset_column, batch_column]:
+                if column in embedding.columns:
+                    row[f"Query_{column}"] = embedding.iloc[query_index].get(column)
+                    row[f"Neighbour_{column}"] = embedding.iloc[neighbour_index].get(column)
+                    row[f"same_{column}"] = bool(
+                        str(row[f"Query_{column}"]) == str(row[f"Neighbour_{column}"])
+                    )
+            rows.append(row)
+    neighbours = pd.DataFrame.from_records(rows)
+    first_neighbour = neighbours.loc[neighbours["rank"].eq(1)].copy()
+    records = []
+    for column, metric_name in [
+        (id_column, "validation_to_train_top1_same_compound_rate"),
+        (label_column, "validation_to_train_top1_same_moa_rate"),
+        (dataset_column, "validation_to_train_top1_same_dataset_rate"),
+        (batch_column, "validation_to_train_top1_same_batch_rate"),
+    ]:
+        flag = f"same_{column}"
+        if flag in first_neighbour.columns:
+            records.append(
+                {
+                    "method": method_name,
+                    "metric": metric_name,
+                    "value": float(first_neighbour[flag].mean()),
+                }
+            )
+    for column, metric_name in [
+        (id_column, "validation_to_train_mean_topk_same_compound_rate"),
+        (label_column, "validation_to_train_mean_topk_same_moa_rate"),
+        (dataset_column, "validation_to_train_mean_topk_same_dataset_rate"),
+        (batch_column, "validation_to_train_mean_topk_same_batch_rate"),
+    ]:
+        flag = f"same_{column}"
+        if flag in neighbours.columns:
+            records.append(
+                {
+                    "method": method_name,
+                    "metric": metric_name,
+                    "value": float(neighbours[flag].mean()),
+                }
+            )
+    records.extend(
+        [
+            {"method": method_name, "metric": "validation_to_train_n_train_rows", "value": float(train_mask.sum())},
+            {"method": method_name, "metric": "validation_to_train_n_validation_rows", "value": float(validation_mask.sum())},
+        ]
+    )
+    return pd.DataFrame.from_records(records), neighbours, split_report
+
+
+def make_label_stratified_row_split(
+    *,
+    labels: np.ndarray,
+    validation_fraction: float,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """Create a deterministic label-stratified row split for benchmark metrics."""
+    rng = np.random.default_rng(seed=int(random_state))
+    labels = np.asarray(labels, dtype=str)
+    train_mask = np.ones(labels.shape[0], dtype=bool)
+    validation_mask = np.zeros(labels.shape[0], dtype=bool)
+    records = []
+    if validation_fraction <= 0:
+        records.append(
+            {
+                "split_status": "validation_disabled",
+                "n_train": int(train_mask.sum()),
+                "n_validation": 0,
+            }
+        )
+        return train_mask, validation_mask, pd.DataFrame.from_records(records)
+    for label in np.unique(labels):
+        indices = np.where(labels == label)[0]
+        n_label = int(indices.shape[0])
+        if n_label < 4:
+            records.append(
+                {
+                    "label": str(label),
+                    "n_profiles": n_label,
+                    "n_train": n_label,
+                    "n_validation": 0,
+                    "reason": "kept_in_train_too_few_profiles_for_validation_pairs",
+                }
+            )
+            continue
+        shuffled = indices.copy()
+        rng.shuffle(shuffled)
+        n_validation = int(round(n_label * float(validation_fraction)))
+        n_validation = min(max(2, n_validation), n_label - 2)
+        selected_validation = shuffled[:n_validation]
+        train_mask[selected_validation] = False
+        validation_mask[selected_validation] = True
+        records.append(
+            {
+                "label": str(label),
+                "n_profiles": n_label,
+                "n_train": int(n_label - n_validation),
+                "n_validation": int(n_validation),
+                "reason": "split_with_positive_pairs_in_both_sets",
+            }
+        )
+    return train_mask, validation_mask, pd.DataFrame.from_records(records)
+
+
 def _numeric_embedding_columns(*, embedding: pd.DataFrame) -> list[str]:
     """Infer numeric embedding columns from a benchmark table."""
     preferred = [column for column in embedding.columns if str(column).startswith("latent_")]
@@ -696,10 +887,37 @@ def run_synthetic_latent_benchmark(
             threads=config.threads,
             method_name="raw_scaled_features",
         )
+        raw_validation_metrics, raw_validation_neighbours, raw_validation_split = (
+            calculate_validation_to_train_retrieval_metrics(
+                embedding=raw_embedding,
+                validation_fraction=float(config.validation_fraction),
+                random_state=int(config.random_state),
+                n_neighbours=config.n_neighbours,
+                threads=config.threads,
+                method_name="raw_scaled_features",
+            )
+        )
+        raw_metrics = pd.concat([raw_metrics, raw_validation_metrics], ignore_index=True, sort=False)
         raw_metrics.insert(0, "scenario", scenario_name)
         raw_neighbours.insert(0, "scenario", scenario_name)
+        if not raw_validation_neighbours.empty:
+            raw_validation_neighbours.insert(0, "scenario", scenario_name)
+        if not raw_validation_split.empty:
+            raw_validation_split.insert(0, "scenario", scenario_name)
         all_metrics.append(raw_metrics)
         write_table(data_frame=raw_neighbours, path=scenario_dir / "raw_feature_neighbours.tsv.gz", logger=logger)
+        if not raw_validation_neighbours.empty:
+            write_table(
+                data_frame=raw_validation_neighbours,
+                path=scenario_dir / "raw_feature_validation_to_train_neighbours.tsv.gz",
+                logger=logger,
+            )
+        if not raw_validation_split.empty:
+            write_table(
+                data_frame=raw_validation_split,
+                path=scenario_dir / "validation_to_train_split_report.tsv",
+                logger=logger,
+            )
 
         if config.run_pca:
             pca_embedding, explained = build_pca_embedding(
@@ -714,12 +932,31 @@ def run_synthetic_latent_benchmark(
                 threads=config.threads,
                 method_name="pca",
             )
+            pca_validation_metrics, pca_validation_neighbours, _pca_validation_split = (
+                calculate_validation_to_train_retrieval_metrics(
+                    embedding=pca_embedding,
+                    validation_fraction=float(config.validation_fraction),
+                    random_state=int(config.random_state),
+                    n_neighbours=config.n_neighbours,
+                    threads=config.threads,
+                    method_name="pca",
+                )
+            )
+            pca_metrics = pd.concat([pca_metrics, pca_validation_metrics], ignore_index=True, sort=False)
             pca_metrics.insert(0, "scenario", scenario_name)
             pca_neighbours.insert(0, "scenario", scenario_name)
+            if not pca_validation_neighbours.empty:
+                pca_validation_neighbours.insert(0, "scenario", scenario_name)
             all_metrics.append(pca_metrics)
             write_table(data_frame=pca_embedding, path=scenario_dir / "pca_latent.tsv.gz", logger=logger)
             write_table(data_frame=explained, path=scenario_dir / "pca_explained_variance.tsv", logger=logger)
             write_table(data_frame=pca_neighbours, path=scenario_dir / "pca_neighbours.tsv.gz", logger=logger)
+            if not pca_validation_neighbours.empty:
+                write_table(
+                    data_frame=pca_validation_neighbours,
+                    path=scenario_dir / "pca_validation_to_train_neighbours.tsv.gz",
+                    logger=logger,
+                )
 
         if config.run_native_contrastive:
             native_tables = _run_native_for_scenario(
@@ -815,8 +1052,21 @@ def _run_native_for_scenario(
         threads=config.threads,
         method_name="cpatk_contrastive",
     )
+    latent_validation_metrics, latent_validation_neighbours, _latent_validation_split = (
+        calculate_validation_to_train_retrieval_metrics(
+            embedding=latent,
+            validation_fraction=float(config.validation_fraction),
+            random_state=int(config.random_state),
+            n_neighbours=config.n_neighbours,
+            threads=config.threads,
+            method_name="cpatk_contrastive",
+        )
+    )
+    latent_metrics = pd.concat([latent_metrics, latent_validation_metrics], ignore_index=True, sort=False)
     latent_metrics.insert(0, "scenario", scenario_name)
     latent_neighbours.insert(0, "scenario", scenario_name)
+    if not latent_validation_neighbours.empty:
+        latent_validation_neighbours.insert(0, "scenario", scenario_name)
     training_summary = result.training_summary.copy()
     training_summary.insert(0, "scenario", scenario_name)
     training_loss = result.training_loss.copy()
@@ -846,6 +1096,12 @@ def _run_native_for_scenario(
     write_table(data_frame=positive_report, path=scenario_dir / "cpatk_contrastive_positive_label_report.tsv", logger=logger)
     write_table(data_frame=split_report, path=scenario_dir / "cpatk_contrastive_split_report.tsv", logger=logger)
     write_table(data_frame=latent_neighbours, path=scenario_dir / "cpatk_contrastive_neighbours.tsv.gz", logger=logger)
+    if not latent_validation_neighbours.empty:
+        write_table(
+            data_frame=latent_validation_neighbours,
+            path=scenario_dir / "cpatk_contrastive_validation_to_train_neighbours.tsv.gz",
+            logger=logger,
+        )
     if not diagnostic_summary.empty:
         write_table(data_frame=diagnostic_summary, path=scenario_dir / "cpatk_contrastive_latent_diagnostics.tsv", logger=logger)
     return {
@@ -860,7 +1116,12 @@ def score_synthetic_scenario(
     metrics: pd.DataFrame,
     scenario_name: str,
 ) -> pd.DataFrame:
-    """Score whether synthetic benchmark behaviour is broadly sensible."""
+    """Score whether synthetic benchmark behaviour is broadly sensible.
+
+    Validation-to-train retrieval is the primary pass/fail metric.  Ordinary
+    all-row retrieval is still reported, but it can be inflated by supervised
+    training rows and should not be used alone to claim generalisation.
+    """
     pivot = metrics.pivot_table(
         index="method",
         columns="metric",
@@ -868,58 +1129,126 @@ def score_synthetic_scenario(
         aggfunc="first",
     )
     rows = []
-    native_top1 = _metric_value(pivot=pivot, method="cpatk_contrastive", metric="top1_same_compound_rate")
-    pca_top1 = _metric_value(pivot=pivot, method="pca", metric="top1_same_compound_rate")
-    raw_top1 = _metric_value(pivot=pivot, method="raw_scaled_features", metric="top1_same_compound_rate")
-    native_dataset = _metric_value(pivot=pivot, method="cpatk_contrastive", metric="top1_same_dataset_rate")
-    native_batch = _metric_value(pivot=pivot, method="cpatk_contrastive", metric="top1_same_batch_rate")
+    native_top1_all = _metric_value(
+        pivot=pivot,
+        method="cpatk_contrastive",
+        metric="top1_same_compound_rate",
+    )
+    native_top1_validation = _metric_value(
+        pivot=pivot,
+        method="cpatk_contrastive",
+        metric="validation_to_train_top1_same_compound_rate",
+    )
+    pca_top1_validation = _metric_value(
+        pivot=pivot,
+        method="pca",
+        metric="validation_to_train_top1_same_compound_rate",
+    )
+    raw_top1_validation = _metric_value(
+        pivot=pivot,
+        method="raw_scaled_features",
+        metric="validation_to_train_top1_same_compound_rate",
+    )
+    native_dataset_validation = _metric_value(
+        pivot=pivot,
+        method="cpatk_contrastive",
+        metric="validation_to_train_top1_same_dataset_rate",
+    )
+    native_batch_validation = _metric_value(
+        pivot=pivot,
+        method="cpatk_contrastive",
+        metric="validation_to_train_top1_same_batch_rate",
+    )
+    overfit_gap = native_top1_all - native_top1_validation
     if scenario_name == "no_biology_negative_control":
-        passed = bool(np.isnan(native_top1) or native_top1 < 0.20)
+        passed = bool(np.isnan(native_top1_validation) or native_top1_validation < 0.10)
         message = (
-            "Negative control should not create strong compound retrieval when no biology was simulated."
+            "Negative control should not show held-out compound retrieval when no biology was simulated."
         )
     elif scenario_name == "weak_biology":
-        passed = bool(np.isfinite(native_top1) and native_top1 >= 0.20)
-        message = "Weak biology scenario should show modest, not necessarily strong, retrieval."
+        passed = bool(np.isfinite(native_top1_validation) and native_top1_validation >= 0.15)
+        message = "Weak biology should show modest held-out retrieval, not just in-sample clustering."
     else:
-        passed = bool(np.isfinite(native_top1) and native_top1 >= max(0.40, pca_top1 - 0.05, raw_top1 - 0.05))
-        message = "Biology-present scenarios should give useful compound retrieval without major regression versus PCA/raw."
+        passed = bool(
+            np.isfinite(native_top1_validation)
+            and native_top1_validation >= max(
+                0.40,
+                pca_top1_validation - 0.05,
+                raw_top1_validation - 0.05,
+            )
+        )
+        message = (
+            "Biology-present scenarios should give useful held-out retrieval without major regression versus PCA/raw."
+        )
     rows.append(
         {
             "scenario": scenario_name,
-            "check": "native_top1_same_compound_rate",
+            "check": "native_validation_to_train_top1_same_compound_rate",
             "passed": passed,
-            "value": native_top1,
-            "comparison_pca": pca_top1,
-            "comparison_raw": raw_top1,
+            "value": native_top1_validation,
+            "comparison_pca": pca_top1_validation,
+            "comparison_raw": raw_top1_validation,
             "message": message,
         }
     )
+    rows.append(
+        {
+            "scenario": scenario_name,
+            "check": "native_all_row_top1_same_compound_rate",
+            "passed": bool(np.isfinite(native_top1_all)),
+            "value": native_top1_all,
+            "comparison_pca": _metric_value(pivot=pivot, method="pca", metric="top1_same_compound_rate"),
+            "comparison_raw": _metric_value(
+                pivot=pivot,
+                method="raw_scaled_features",
+                metric="top1_same_compound_rate",
+            ),
+            "message": "All-row retrieval is reported for context but is not used as the main generalisation check.",
+        }
+    )
+    rows.append(
+        {
+            "scenario": scenario_name,
+            "check": "native_all_row_minus_validation_gap",
+            "passed": bool(
+                not np.isfinite(overfit_gap)
+                or overfit_gap <= 0.25
+                or scenario_name == "no_biology_negative_control"
+            ),
+            "value": overfit_gap,
+            "comparison_pca": np.nan,
+            "comparison_raw": np.nan,
+            "message": (
+                "Large all-row minus held-out retrieval gaps suggest in-sample clustering or overfit risk. "
+                "For the no-biology control this is recorded as a warning rather than the primary pass/fail."
+            ),
+        }
+    )
     leakage_passed = bool(
-        not np.isfinite(native_dataset)
-        or native_dataset <= 0.90
+        not np.isfinite(native_dataset_validation)
+        or native_dataset_validation <= 0.90
         or scenario_name == "no_biology_negative_control"
     )
     rows.append(
         {
             "scenario": scenario_name,
-            "check": "native_dataset_leakage_not_extreme",
+            "check": "native_validation_dataset_leakage_not_extreme",
             "passed": leakage_passed,
-            "value": native_dataset,
+            "value": native_dataset_validation,
             "comparison_pca": np.nan,
             "comparison_raw": np.nan,
-            "message": "Same-dataset nearest-neighbour rate should not dominate in ordinary biology scenarios.",
+            "message": "Held-out same-dataset nearest-neighbour rate should not dominate ordinary biology scenarios.",
         }
     )
     rows.append(
         {
             "scenario": scenario_name,
-            "check": "native_batch_leakage_recorded",
+            "check": "native_validation_batch_leakage_recorded",
             "passed": True,
-            "value": native_batch,
+            "value": native_batch_validation,
             "comparison_pca": np.nan,
             "comparison_raw": np.nan,
-            "message": "Batch leakage is recorded as a diagnostic rather than a hard failure in synthetic stress tests.",
+            "message": "Held-out batch leakage is recorded as a diagnostic rather than a hard failure in synthetic stress tests.",
         }
     )
     return pd.DataFrame.from_records(rows)
