@@ -1,33 +1,37 @@
 #!/usr/bin/env bash
 #$ -jc rhel9
 #$ -j y
-#$ -N cpatk_synth_latent
+#$ -N cpatk_synth_v031
 #$ -jc long
 #$ -pe smp 16
-#$ -mods l_hard mfree 64G
-#$ -adds l_hard h_vmem 64G
+#$ -mods l_hard mfree 96G
+#$ -adds l_hard h_vmem 96G
 #$ -cwd
 # Optional GPU-backed native contrastive benchmark. Uncomment if desired and
 # if these resource names match the local SGE setup.
 ##$ -adds l_hard gpu 1
 ##$ -adds l_hard cuda.0.name 'NVIDIA A40'
 
-# CPATK v0.2.30 synthetic latent benchmark.
-# This creates controlled Cell Painting-like datasets and compares raw features,
-# PCA and CPATK-native contrastive latent embeddings under clean, batch-confounded,
-# weak-biology and no-biology negative-control scenarios.
+# CPATK v0.2.31 comprehensive synthetic latent validation.
+# This is deliberately more demanding than the v0.2.30 smoke benchmark. It runs
+# repeated random seeds across clean, weak, confounded, noisy-label, missingness,
+# missing-compartment, outlier and negative-control scenarios. The primary metric
+# is held-out validation-to-train compound retrieval, not all-row retrieval.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 BASE_DIR="${BASE_DIR:-/home/${USER}/data/2025_jason_cell_painting/data/cpatk_synthetic_benchmarks}"
-OUT_DIR="${OUT_DIR:-${BASE_DIR}/cpatk_v0_2_30_synthetic_latent_${RUN_TAG}}"
+OUT_DIR="${OUT_DIR:-${BASE_DIR}/cpatk_v0_2_31_comprehensive_synthetic_latent_${RUN_TAG}}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-cpatk}"
 THREADS="${THREADS:-${NSLOTS:-16}}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
-SCENARIOS="${SCENARIOS:-clean_biology,batch_confounded_biology,weak_biology,no_biology_negative_control}"
+BENCHMARK_MODE="${BENCHMARK_MODE:-comprehensive}"
+# Leave SCENARIOS empty to use the v0.2.31 comprehensive preset.
+SCENARIOS="${SCENARIOS:-}"
+SEED_VALUES="${SEED_VALUES:-42,101,202,303,404}"
 N_COMPOUNDS="${N_COMPOUNDS:-48}"
 N_MOA_CLASSES="${N_MOA_CLASSES:-8}"
 N_BATCHES="${N_BATCHES:-4}"
@@ -81,14 +85,16 @@ export VECLIB_MAXIMUM_THREADS="${THREADS}"
 export BLIS_NUM_THREADS="${THREADS}"
 export POLARS_MAX_THREADS="${THREADS}"
 
-section "Synthetic latent benchmark configuration"
+section "Comprehensive synthetic latent validation configuration"
 mkdir -p "${OUT_DIR}"
 {
   printf 'item\tvalue\n'
   printf 'run_tag\t%s\n' "${RUN_TAG}"
   printf 'out_dir\t%s\n' "${OUT_DIR}"
   printf 'threads\t%s\n' "${THREADS}"
-  printf 'scenarios\t%s\n' "${SCENARIOS}"
+  printf 'benchmark_mode\t%s\n' "${BENCHMARK_MODE}"
+  printf 'scenarios\t%s\n' "${SCENARIOS:-v0.2.31_comprehensive_preset}"
+  printf 'seed_values\t%s\n' "${SEED_VALUES}"
   printf 'n_compounds\t%s\n' "${N_COMPOUNDS}"
   printf 'n_moa_classes\t%s\n' "${N_MOA_CLASSES}"
   printf 'n_batches\t%s\n' "${N_BATCHES}"
@@ -108,34 +114,43 @@ mkdir -p "${OUT_DIR}"
   printf 'n_neighbours\t%s\n' "${N_NEIGHBOURS}"
   printf 'random_state\t%s\n' "${RANDOM_STATE}"
 } > "${OUT_DIR}/run_configuration.tsv"
-section "Run CPATK synthetic latent benchmark"
-set -x
-cpatk-synthetic-latent-benchmark \
-  --output_dir "${OUT_DIR}" \
-  --scenarios "${SCENARIOS}" \
-  --n_compounds "${N_COMPOUNDS}" \
-  --n_moa_classes "${N_MOA_CLASSES}" \
-  --n_batches "${N_BATCHES}" \
-  --n_datasets "${N_DATASETS}" \
-  --replicates_per_compound_dataset "${REPLICATES_PER_COMPOUND_DATASET}" \
-  --n_features "${N_FEATURES}" \
-  --n_informative_features "${N_INFORMATIVE_FEATURES}" \
-  --latent_dim "${LATENT_DIM}" \
-  --epochs "${EPOCHS}" \
-  --batch_size "${BATCH_SIZE}" \
-  --steps_per_epoch "${STEPS_PER_EPOCH}" \
-  --validation_fraction "${VALIDATION_FRACTION}" \
-  --learning_rate "${LEARNING_RATE}" \
-  --temperature "${TEMPERATURE}" \
-  --hidden_dims "${HIDDEN_DIMS}" \
-  --dropout "${DROPOUT}" \
-  --random_state "${RANDOM_STATE}" \
-  --n_neighbours "${N_NEIGHBOURS}" \
-  --threads "${THREADS}" \
+
+section "Run CPATK comprehensive synthetic latent validation"
+CMD=(
+  cpatk-synthetic-latent-benchmark
+  --output_dir "${OUT_DIR}"
+  --benchmark_mode "${BENCHMARK_MODE}"
+  --seed_values "${SEED_VALUES}"
+  --n_compounds "${N_COMPOUNDS}"
+  --n_moa_classes "${N_MOA_CLASSES}"
+  --n_batches "${N_BATCHES}"
+  --n_datasets "${N_DATASETS}"
+  --replicates_per_compound_dataset "${REPLICATES_PER_COMPOUND_DATASET}"
+  --n_features "${N_FEATURES}"
+  --n_informative_features "${N_INFORMATIVE_FEATURES}"
+  --latent_dim "${LATENT_DIM}"
+  --epochs "${EPOCHS}"
+  --batch_size "${BATCH_SIZE}"
+  --steps_per_epoch "${STEPS_PER_EPOCH}"
+  --validation_fraction "${VALIDATION_FRACTION}"
+  --learning_rate "${LEARNING_RATE}"
+  --temperature "${TEMPERATURE}"
+  --hidden_dims "${HIDDEN_DIMS}"
+  --random_state "${RANDOM_STATE}"
+  --n_neighbours "${N_NEIGHBOURS}"
+  --threads "${THREADS}"
   --log_level "${LOG_LEVEL}"
+)
+if [[ -n "${SCENARIOS}" ]]; then
+  CMD+=(--scenarios "${SCENARIOS}")
+fi
+set -x
+"${CMD[@]}"
 set +x
 
-section "Synthetic latent benchmark complete"
+section "Comprehensive synthetic latent validation complete"
 echo "Output directory: ${OUT_DIR}"
-echo "Summary: ${OUT_DIR}/synthetic_metric_summary.tsv"
-echo "Pass/fail: ${OUT_DIR}/synthetic_pass_fail_summary.tsv"
+echo "Metric summary: ${OUT_DIR}/synthetic_metric_summary.tsv"
+echo "Pass/fail summary: ${OUT_DIR}/synthetic_pass_fail_summary.tsv"
+echo "Decision summary: ${OUT_DIR}/synthetic_validation_decision_summary.tsv"
+echo "Excel summary: ${OUT_DIR}/synthetic_latent_benchmark_summary.xlsx"

@@ -5,7 +5,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from cpatk.synthetic_latent import SCENARIO_PRESETS, run_synthetic_latent_benchmark_from_cli
+from cpatk.synthetic_latent import (
+    COMPREHENSIVE_SYNTHETIC_SCENARIOS,
+    QUICK_SYNTHETIC_SCENARIOS,
+    SCENARIO_PRESETS,
+    run_synthetic_latent_benchmark_from_cli,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -18,9 +23,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output_dir", required=True, help="Output directory for benchmark tables.")
     parser.add_argument(
+        "--benchmark_mode",
+        choices=["quick", "standard", "comprehensive"],
+        default="standard",
+        help=(
+            "Benchmark size. quick uses the four core scenarios and one seed; "
+            "standard keeps the v0.2.30-style core scenarios; comprehensive "
+            "uses the expanded stress grid and repeated seeds."
+        ),
+    )
+    parser.add_argument(
         "--scenarios",
-        default=",".join(SCENARIO_PRESETS),
-        help="Comma-separated scenarios to run. Known values: " + ",".join(sorted(SCENARIO_PRESETS)),
+        default="",
+        help=(
+            "Optional comma-separated scenarios to run. If empty, scenarios are "
+            "chosen from --benchmark_mode. Known values: " + ",".join(sorted(SCENARIO_PRESETS))
+        ),
+    )
+    parser.add_argument(
+        "--seed_values",
+        default="",
+        help=(
+            "Optional comma-separated random seeds. If empty, quick/standard use "
+            "--random_state only; comprehensive uses 42,101,202,303,404."
+        ),
     )
     parser.add_argument("--n_compounds", type=int, default=36)
     parser.add_argument("--n_moa_classes", type=int, default=6)
@@ -65,9 +91,21 @@ def parse_csv_ints(*, value: str) -> list[int]:
 def main() -> None:
     """Run the command-line entry point."""
     args = build_parser().parse_args()
+    if args.scenarios:
+        scenarios = parse_csv_strings(value=args.scenarios)
+    elif args.benchmark_mode == "comprehensive":
+        scenarios = list(COMPREHENSIVE_SYNTHETIC_SCENARIOS)
+    else:
+        scenarios = list(QUICK_SYNTHETIC_SCENARIOS)
+    if args.seed_values:
+        seed_values = parse_csv_ints(value=args.seed_values)
+    elif args.benchmark_mode == "comprehensive":
+        seed_values = [42, 101, 202, 303, 404]
+    else:
+        seed_values = []
     run_synthetic_latent_benchmark_from_cli(
         output_dir=Path(args.output_dir),
-        scenarios=parse_csv_strings(value=args.scenarios),
+        scenarios=scenarios,
         n_compounds=args.n_compounds,
         n_moa_classes=args.n_moa_classes,
         n_batches=args.n_batches,
@@ -85,6 +123,8 @@ def main() -> None:
         hidden_dims=parse_csv_ints(value=args.hidden_dims),
         dropout=args.dropout,
         random_state=args.random_state,
+        seed_values=seed_values,
+        benchmark_mode=args.benchmark_mode,
         n_neighbours=args.n_neighbours,
         threads=args.threads,
         skip_native_contrastive=args.skip_native_contrastive,

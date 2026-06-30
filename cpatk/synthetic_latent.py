@@ -62,6 +62,13 @@ class SyntheticCellPaintingConfig:
     feature_noise: float = 0.25
     nonlinear_fraction: float = 0.10
     missing_fraction: float = 0.01
+    label_noise_fraction: float = 0.0
+    high_missing_row_fraction: float = 0.0
+    high_missing_row_feature_fraction: float = 0.75
+    missing_compartment_fraction: float = 0.0
+    segmentation_outlier_fraction: float = 0.0
+    segmentation_outlier_scale: float = 6.0
+    compound_plate_confounding: float = 0.0
     random_state: int = 42
     metadata_prefix: str = "Metadata"
 
@@ -96,6 +103,8 @@ class LatentBenchmarkConfig:
     hidden_dims: list[int] = field(default_factory=lambda: [256, 128])
     dropout: float = 0.10
     random_state: int = 42
+    seed_values: list[int] = field(default_factory=list)
+    benchmark_mode: str = "standard"
     n_neighbours: int = 5
     threads: int = 1
     run_native_contrastive: bool = True
@@ -135,7 +144,112 @@ SCENARIO_PRESETS: dict[str, dict[str, float]] = {
         "replicate_noise": 1.0,
         "feature_noise": 0.30,
     },
+    "medium_biology": {
+        "biology_strength": 1.4,
+        "moa_strength": 0.6,
+        "batch_strength": 1.0,
+        "dataset_strength": 0.8,
+        "replicate_noise": 0.90,
+        "feature_noise": 0.28,
+    },
+    "strong_batch_confounding": {
+        "biology_strength": 1.7,
+        "moa_strength": 0.7,
+        "batch_strength": 3.0,
+        "dataset_strength": 2.0,
+        "replicate_noise": 0.90,
+        "feature_noise": 0.30,
+    },
+    "label_noise_10pct": {
+        "biology_strength": 1.8,
+        "moa_strength": 0.7,
+        "batch_strength": 1.4,
+        "dataset_strength": 1.0,
+        "replicate_noise": 0.90,
+        "feature_noise": 0.30,
+        "label_noise_fraction": 0.10,
+    },
+    "label_noise_25pct": {
+        "biology_strength": 1.8,
+        "moa_strength": 0.7,
+        "batch_strength": 1.4,
+        "dataset_strength": 1.0,
+        "replicate_noise": 0.95,
+        "feature_noise": 0.32,
+        "label_noise_fraction": 0.25,
+    },
+    "high_missingness": {
+        "biology_strength": 1.7,
+        "moa_strength": 0.7,
+        "batch_strength": 1.3,
+        "dataset_strength": 0.9,
+        "replicate_noise": 0.95,
+        "feature_noise": 0.32,
+        "missing_fraction": 0.08,
+        "high_missing_row_fraction": 0.08,
+        "high_missing_row_feature_fraction": 0.70,
+    },
+    "missing_compartment": {
+        "biology_strength": 1.7,
+        "moa_strength": 0.7,
+        "batch_strength": 1.3,
+        "dataset_strength": 0.9,
+        "replicate_noise": 0.95,
+        "feature_noise": 0.32,
+        "missing_compartment_fraction": 0.25,
+    },
+    "segmentation_outliers": {
+        "biology_strength": 1.7,
+        "moa_strength": 0.7,
+        "batch_strength": 1.3,
+        "dataset_strength": 0.9,
+        "replicate_noise": 0.95,
+        "feature_noise": 0.32,
+        "segmentation_outlier_fraction": 0.06,
+        "segmentation_outlier_scale": 8.0,
+    },
+    "compound_plate_confounding": {
+        "biology_strength": 1.6,
+        "moa_strength": 0.7,
+        "batch_strength": 2.5,
+        "dataset_strength": 1.2,
+        "replicate_noise": 0.95,
+        "feature_noise": 0.32,
+        "compound_plate_confounding": 0.85,
+    },
+    "no_biology_high_batch_negative_control": {
+        "biology_strength": 0.0,
+        "moa_strength": 0.0,
+        "batch_strength": 2.5,
+        "dataset_strength": 2.0,
+        "replicate_noise": 1.0,
+        "feature_noise": 0.30,
+        "compound_plate_confounding": 0.85,
+    },
 }
+
+QUICK_SYNTHETIC_SCENARIOS = [
+    "clean_biology",
+    "batch_confounded_biology",
+    "weak_biology",
+    "no_biology_negative_control",
+]
+
+COMPREHENSIVE_SYNTHETIC_SCENARIOS = [
+    "clean_biology",
+    "medium_biology",
+    "weak_biology",
+    "batch_confounded_biology",
+    "strong_batch_confounding",
+    "label_noise_10pct",
+    "label_noise_25pct",
+    "high_missingness",
+    "missing_compartment",
+    "segmentation_outliers",
+    "compound_plate_confounding",
+    "no_biology_negative_control",
+    "no_biology_high_batch_negative_control",
+]
 
 
 def require_sklearn_for_synthetic(*, purpose: str) -> None:
@@ -230,7 +344,10 @@ def generate_synthetic_cell_painting_profiles(
         moa_label = moa_labels[compound_index]
         for dataset_index, dataset_name in enumerate(datasets):
             for replicate in range(int(config.replicates_per_compound_dataset)):
-                batch_index = int((compound_index + replicate + dataset_index) % config.n_batches)
+                if rng.random() < float(config.compound_plate_confounding):
+                    batch_index = int(compound_index % config.n_batches)
+                else:
+                    batch_index = int((compound_index + replicate + dataset_index) % config.n_batches)
                 batch_name = batches[batch_index]
                 values = np.zeros(config.n_features, dtype=float)
                 values[: config.n_informative_features] += (
@@ -280,6 +397,12 @@ def generate_synthetic_cell_painting_profiles(
                 )
                 image_number += 1
     profiles = pd.DataFrame.from_records(rows)
+    profiles = apply_synthetic_profile_perturbations(
+        profiles=profiles,
+        feature_names=feature_names,
+        config=config,
+        rng=rng,
+    )
     truth = pd.DataFrame.from_records(ground_truth_rows)
     scenario_table = pd.DataFrame(
         [
@@ -318,6 +441,91 @@ def generate_synthetic_cell_painting_profiles(
             len(feature_names),
         )
     return profiles, truth, scenario_table
+
+
+def apply_synthetic_profile_perturbations(
+    *,
+    profiles: pd.DataFrame,
+    feature_names: Sequence[str],
+    config: SyntheticCellPaintingConfig,
+    rng: np.random.Generator,
+) -> pd.DataFrame:
+    """Apply controlled imperfections to synthetic profile data.
+
+    The perturbations deliberately mimic real Cell Painting problems: noisy
+    supervision labels, high-missingness images, missing feature blocks that act
+    like missing compartments, and segmentation/debris-like outlier profiles.
+    Ground-truth retrieval metrics still use ``cpd_id`` while the native
+    contrastive trainer uses ``training_cpd_id``.
+    """
+    output = profiles.copy()
+    n_rows = int(output.shape[0])
+    feature_names = [str(feature) for feature in feature_names]
+    output["training_cpd_id"] = output["cpd_id"].astype(str).to_numpy()
+    output["synthetic_label_noised"] = False
+    output["synthetic_high_missing_row"] = False
+    output["synthetic_missing_compartment"] = False
+    output["synthetic_segmentation_outlier"] = False
+
+    if float(config.label_noise_fraction) > 0 and n_rows > 0:
+        labels = output["training_cpd_id"].astype(str).to_numpy()
+        unique_labels = np.unique(labels)
+        n_noisy = int(round(n_rows * float(config.label_noise_fraction)))
+        n_noisy = min(max(0, n_noisy), n_rows)
+        if n_noisy > 0 and unique_labels.shape[0] > 1:
+            noisy_rows = rng.choice(np.arange(n_rows), size=n_noisy, replace=False)
+            for row_index in noisy_rows:
+                current = labels[row_index]
+                alternatives = unique_labels[unique_labels != current]
+                labels[row_index] = str(rng.choice(alternatives))
+            output["training_cpd_id"] = labels
+            output.loc[noisy_rows, "synthetic_label_noised"] = True
+
+    if float(config.high_missing_row_fraction) > 0 and n_rows > 0:
+        n_bad_rows = int(round(n_rows * float(config.high_missing_row_fraction)))
+        n_bad_rows = min(max(0, n_bad_rows), n_rows)
+        n_bad_features = int(round(len(feature_names) * float(config.high_missing_row_feature_fraction)))
+        n_bad_features = min(max(1, n_bad_features), len(feature_names))
+        if n_bad_rows > 0:
+            bad_rows = rng.choice(np.arange(n_rows), size=n_bad_rows, replace=False)
+            for row_index in bad_rows:
+                bad_features = rng.choice(feature_names, size=n_bad_features, replace=False)
+                output.loc[output.index[row_index], bad_features] = np.nan
+            output.loc[bad_rows, "synthetic_high_missing_row"] = True
+
+    if float(config.missing_compartment_fraction) > 0 and n_rows > 0:
+        n_groups = 4
+        group_size = int(math.ceil(len(feature_names) / n_groups))
+        n_missing_groups = min(
+            n_groups,
+            max(1, int(round(n_groups * float(config.missing_compartment_fraction)))),
+        )
+        for dataset_name in output["Dataset"].dropna().astype(str).unique():
+            dataset_mask = output["Dataset"].astype(str).eq(dataset_name)
+            group_indices = rng.choice(np.arange(n_groups), size=n_missing_groups, replace=False)
+            for group_index in group_indices:
+                start = int(group_index * group_size)
+                stop = min(len(feature_names), int((group_index + 1) * group_size))
+                if start < stop:
+                    output.loc[dataset_mask, feature_names[start:stop]] = np.nan
+                    output.loc[dataset_mask, "synthetic_missing_compartment"] = True
+
+    if float(config.segmentation_outlier_fraction) > 0 and n_rows > 0:
+        n_outliers = int(round(n_rows * float(config.segmentation_outlier_fraction)))
+        n_outliers = min(max(0, n_outliers), n_rows)
+        if n_outliers > 0:
+            outlier_rows = rng.choice(np.arange(n_rows), size=n_outliers, replace=False)
+            noise = rng.normal(
+                loc=0.0,
+                scale=float(config.segmentation_outlier_scale),
+                size=(n_outliers, len(feature_names)),
+            )
+            output.loc[output.index[outlier_rows], feature_names] = (
+                output.loc[output.index[outlier_rows], feature_names].to_numpy(dtype=float) + noise
+            )
+            output.loc[outlier_rows, "synthetic_segmentation_outlier"] = True
+
+    return output
 
 
 def _validate_synthetic_config(*, config: SyntheticCellPaintingConfig) -> None:
@@ -414,6 +622,7 @@ def _metadata_for_native_backend(*, datasets: dict[str, pd.DataFrame]) -> pd.Dat
     """Create row-aligned metadata for native contrastive benchmarking."""
     metadata_columns = [
         "cpd_id",
+        "training_cpd_id",
         "cpd_type",
         "Metadata_Compound",
         "Metadata_Plate",
@@ -421,6 +630,10 @@ def _metadata_for_native_backend(*, datasets: dict[str, pd.DataFrame]) -> pd.Dat
         "Metadata_Profile_Source",
         "synthetic_batch",
         "synthetic_scenario",
+        "synthetic_label_noised",
+        "synthetic_high_missing_row",
+        "synthetic_missing_compartment",
+        "synthetic_segmentation_outlier",
     ]
     records = []
     for dataset_name, table in datasets.items():
@@ -837,153 +1050,202 @@ def run_synthetic_latent_benchmark(
     all_training = []
     all_quality = []
     scenario_tables = []
-    for scenario_index, scenario_name in enumerate(config.scenarios):
-        scenario_dir = config.output_dir / scenario_name
-        scenario_dir.mkdir(parents=True, exist_ok=True)
-        base_config = SyntheticCellPaintingConfig(
-            scenario_name=scenario_name,
-            n_compounds=config.n_compounds,
-            n_moa_classes=config.n_moa_classes,
-            n_batches=config.n_batches,
-            n_datasets=config.n_datasets,
-            replicates_per_compound_dataset=config.replicates_per_compound_dataset,
-            n_features=config.n_features,
-            n_informative_features=config.n_informative_features,
-            random_state=int(config.random_state + scenario_index * 997),
-        )
-        synthetic_config = config_for_scenario(
-            scenario_name=scenario_name,
-            base_config=base_config,
-        )
-        profiles, truth, scenario_table = generate_synthetic_cell_painting_profiles(
-            config=synthetic_config,
-            logger=logger,
-        )
-        feature_columns = infer_synthetic_feature_columns(profiles=profiles)
-        write_table(data_frame=profiles, path=scenario_dir / "synthetic_profiles.tsv.gz", logger=logger)
-        write_table(data_frame=truth, path=scenario_dir / "synthetic_ground_truth.tsv", logger=logger)
-        write_table(data_frame=scenario_table, path=scenario_dir / "synthetic_scenario_config.tsv", logger=logger)
-        scenario_table.insert(0, "scenario", scenario_name)
-        scenario_tables.append(scenario_table)
+    seed_values = list(config.seed_values) if config.seed_values else [int(config.random_state)]
+    benchmark_records = []
+    for seed_index, seed_value in enumerate(seed_values):
+        for scenario_index, scenario_name in enumerate(config.scenarios):
+            benchmark_run_id = f"{scenario_name}__seed_{int(seed_value)}"
+            scenario_directory_name = scenario_name if len(seed_values) == 1 else benchmark_run_id
+            scenario_dir = config.output_dir / scenario_directory_name
+            scenario_dir.mkdir(parents=True, exist_ok=True)
+            base_config = SyntheticCellPaintingConfig(
+                scenario_name=scenario_name,
+                n_compounds=config.n_compounds,
+                n_moa_classes=config.n_moa_classes,
+                n_batches=config.n_batches,
+                n_datasets=config.n_datasets,
+                replicates_per_compound_dataset=config.replicates_per_compound_dataset,
+                n_features=config.n_features,
+                n_informative_features=config.n_informative_features,
+                random_state=int(seed_value + scenario_index * 997),
+            )
+            synthetic_config = config_for_scenario(
+                scenario_name=scenario_name,
+                base_config=base_config,
+            )
+            profiles, truth, scenario_table = generate_synthetic_cell_painting_profiles(
+                config=synthetic_config,
+                logger=logger,
+            )
+            feature_columns = infer_synthetic_feature_columns(profiles=profiles)
+            write_table(data_frame=profiles, path=scenario_dir / "synthetic_profiles.tsv.gz", logger=logger)
+            write_table(data_frame=truth, path=scenario_dir / "synthetic_ground_truth.tsv", logger=logger)
+            write_table(data_frame=scenario_table, path=scenario_dir / "synthetic_scenario_config.tsv", logger=logger)
+            scenario_table.insert(0, "benchmark_run_id", benchmark_run_id)
+            scenario_table.insert(1, "scenario", scenario_name)
+            scenario_table.insert(2, "seed", int(seed_value))
+            scenario_tables.append(scenario_table)
+            benchmark_records.append(
+                {
+                    "benchmark_run_id": benchmark_run_id,
+                    "scenario": scenario_name,
+                    "seed": int(seed_value),
+                    "n_profiles": int(profiles.shape[0]),
+                    "n_features": int(len(feature_columns)),
+                }
+            )
 
-        raw_embedding = profiles.loc[:, feature_columns].copy()
-        for column in [
-            "Dataset",
-            "Sample",
-            "cpd_id",
-            "cpd_type",
-            "Metadata_Compound",
-            "Metadata_Plate",
-            "Metadata_Well",
-            "Metadata_Profile_Source",
-            "synthetic_batch",
-            "synthetic_scenario",
-        ]:
-            if column in profiles.columns:
-                raw_embedding[column] = profiles[column].to_numpy()
-        raw_metrics, raw_neighbours = calculate_embedding_retrieval_metrics(
-            embedding=raw_embedding,
-            n_neighbours=config.n_neighbours,
-            threads=config.threads,
-            method_name="raw_scaled_features",
-        )
-        raw_validation_metrics, raw_validation_neighbours, raw_validation_split = (
-            calculate_validation_to_train_retrieval_metrics(
+            raw_embedding = profiles.loc[:, feature_columns].copy()
+            for column in [
+                "Dataset",
+                "Sample",
+                "cpd_id",
+                "training_cpd_id",
+                "cpd_type",
+                "Metadata_Compound",
+                "Metadata_Plate",
+                "Metadata_Well",
+                "Metadata_Profile_Source",
+                "synthetic_batch",
+                "synthetic_scenario",
+                "synthetic_label_noised",
+                "synthetic_high_missing_row",
+                "synthetic_missing_compartment",
+                "synthetic_segmentation_outlier",
+            ]:
+                if column in profiles.columns:
+                    raw_embedding[column] = profiles[column].to_numpy()
+            raw_metrics, raw_neighbours = calculate_embedding_retrieval_metrics(
                 embedding=raw_embedding,
-                validation_fraction=float(config.validation_fraction),
-                random_state=int(config.random_state),
                 n_neighbours=config.n_neighbours,
                 threads=config.threads,
                 method_name="raw_scaled_features",
             )
-        )
-        raw_metrics = pd.concat([raw_metrics, raw_validation_metrics], ignore_index=True, sort=False)
-        raw_metrics.insert(0, "scenario", scenario_name)
-        raw_neighbours.insert(0, "scenario", scenario_name)
-        if not raw_validation_neighbours.empty:
-            raw_validation_neighbours.insert(0, "scenario", scenario_name)
-        if not raw_validation_split.empty:
-            raw_validation_split.insert(0, "scenario", scenario_name)
-        all_metrics.append(raw_metrics)
-        write_table(data_frame=raw_neighbours, path=scenario_dir / "raw_feature_neighbours.tsv.gz", logger=logger)
-        if not raw_validation_neighbours.empty:
-            write_table(
-                data_frame=raw_validation_neighbours,
-                path=scenario_dir / "raw_feature_validation_to_train_neighbours.tsv.gz",
-                logger=logger,
-            )
-        if not raw_validation_split.empty:
-            write_table(
-                data_frame=raw_validation_split,
-                path=scenario_dir / "validation_to_train_split_report.tsv",
-                logger=logger,
-            )
-
-        if config.run_pca:
-            pca_embedding, explained = build_pca_embedding(
-                profiles=profiles,
-                feature_columns=feature_columns,
-                n_components=config.latent_dim,
-                random_state=config.random_state,
-            )
-            pca_metrics, pca_neighbours = calculate_embedding_retrieval_metrics(
-                embedding=pca_embedding,
-                n_neighbours=config.n_neighbours,
-                threads=config.threads,
-                method_name="pca",
-            )
-            pca_validation_metrics, pca_validation_neighbours, _pca_validation_split = (
+            raw_validation_metrics, raw_validation_neighbours, raw_validation_split = (
                 calculate_validation_to_train_retrieval_metrics(
-                    embedding=pca_embedding,
+                    embedding=raw_embedding,
                     validation_fraction=float(config.validation_fraction),
-                    random_state=int(config.random_state),
+                    random_state=int(seed_value),
+                    n_neighbours=config.n_neighbours,
+                    threads=config.threads,
+                    method_name="raw_scaled_features",
+                )
+            )
+            raw_metrics = pd.concat([raw_metrics, raw_validation_metrics], ignore_index=True, sort=False)
+            raw_metrics.insert(0, "benchmark_run_id", benchmark_run_id)
+            raw_metrics.insert(1, "scenario", scenario_name)
+            raw_metrics.insert(2, "seed", int(seed_value))
+            raw_neighbours.insert(0, "benchmark_run_id", benchmark_run_id)
+            raw_neighbours.insert(1, "scenario", scenario_name)
+            raw_neighbours.insert(2, "seed", int(seed_value))
+            if not raw_validation_neighbours.empty:
+                raw_validation_neighbours.insert(0, "benchmark_run_id", benchmark_run_id)
+                raw_validation_neighbours.insert(1, "scenario", scenario_name)
+                raw_validation_neighbours.insert(2, "seed", int(seed_value))
+            if not raw_validation_split.empty:
+                raw_validation_split.insert(0, "benchmark_run_id", benchmark_run_id)
+                raw_validation_split.insert(1, "scenario", scenario_name)
+                raw_validation_split.insert(2, "seed", int(seed_value))
+            all_metrics.append(raw_metrics)
+            write_table(data_frame=raw_neighbours, path=scenario_dir / "raw_feature_neighbours.tsv.gz", logger=logger)
+            if not raw_validation_neighbours.empty:
+                write_table(
+                    data_frame=raw_validation_neighbours,
+                    path=scenario_dir / "raw_feature_validation_to_train_neighbours.tsv.gz",
+                    logger=logger,
+                )
+            if not raw_validation_split.empty:
+                write_table(
+                    data_frame=raw_validation_split,
+                    path=scenario_dir / "validation_to_train_split_report.tsv",
+                    logger=logger,
+                )
+
+            if config.run_pca:
+                pca_embedding, explained = build_pca_embedding(
+                    profiles=profiles,
+                    feature_columns=feature_columns,
+                    n_components=config.latent_dim,
+                    random_state=int(seed_value),
+                )
+                pca_metrics, pca_neighbours = calculate_embedding_retrieval_metrics(
+                    embedding=pca_embedding,
                     n_neighbours=config.n_neighbours,
                     threads=config.threads,
                     method_name="pca",
                 )
-            )
-            pca_metrics = pd.concat([pca_metrics, pca_validation_metrics], ignore_index=True, sort=False)
-            pca_metrics.insert(0, "scenario", scenario_name)
-            pca_neighbours.insert(0, "scenario", scenario_name)
-            if not pca_validation_neighbours.empty:
-                pca_validation_neighbours.insert(0, "scenario", scenario_name)
-            all_metrics.append(pca_metrics)
-            write_table(data_frame=pca_embedding, path=scenario_dir / "pca_latent.tsv.gz", logger=logger)
-            write_table(data_frame=explained, path=scenario_dir / "pca_explained_variance.tsv", logger=logger)
-            write_table(data_frame=pca_neighbours, path=scenario_dir / "pca_neighbours.tsv.gz", logger=logger)
-            if not pca_validation_neighbours.empty:
-                write_table(
-                    data_frame=pca_validation_neighbours,
-                    path=scenario_dir / "pca_validation_to_train_neighbours.tsv.gz",
+                pca_validation_metrics, pca_validation_neighbours, _pca_validation_split = (
+                    calculate_validation_to_train_retrieval_metrics(
+                        embedding=pca_embedding,
+                        validation_fraction=float(config.validation_fraction),
+                        random_state=int(seed_value),
+                        n_neighbours=config.n_neighbours,
+                        threads=config.threads,
+                        method_name="pca",
+                    )
+                )
+                pca_metrics = pd.concat([pca_metrics, pca_validation_metrics], ignore_index=True, sort=False)
+                pca_metrics.insert(0, "benchmark_run_id", benchmark_run_id)
+                pca_metrics.insert(1, "scenario", scenario_name)
+                pca_metrics.insert(2, "seed", int(seed_value))
+                pca_neighbours.insert(0, "benchmark_run_id", benchmark_run_id)
+                pca_neighbours.insert(1, "scenario", scenario_name)
+                pca_neighbours.insert(2, "seed", int(seed_value))
+                if not pca_validation_neighbours.empty:
+                    pca_validation_neighbours.insert(0, "benchmark_run_id", benchmark_run_id)
+                    pca_validation_neighbours.insert(1, "scenario", scenario_name)
+                    pca_validation_neighbours.insert(2, "seed", int(seed_value))
+                all_metrics.append(pca_metrics)
+                write_table(data_frame=pca_embedding, path=scenario_dir / "pca_latent.tsv.gz", logger=logger)
+                write_table(data_frame=explained, path=scenario_dir / "pca_explained_variance.tsv", logger=logger)
+                write_table(data_frame=pca_neighbours, path=scenario_dir / "pca_neighbours.tsv.gz", logger=logger)
+                if not pca_validation_neighbours.empty:
+                    write_table(
+                        data_frame=pca_validation_neighbours,
+                        path=scenario_dir / "pca_validation_to_train_neighbours.tsv.gz",
+                        logger=logger,
+                    )
+
+            if config.run_native_contrastive:
+                native_tables = _run_native_for_scenario(
+                    profiles=profiles,
+                    feature_columns=feature_columns,
+                    scenario_name=scenario_name,
+                    benchmark_run_id=benchmark_run_id,
+                    seed_value=int(seed_value),
+                    scenario_dir=scenario_dir,
+                    config=config,
                     logger=logger,
                 )
+                all_metrics.append(native_tables["metrics"])
+                all_training.append(native_tables["training_summary"])
+                all_quality.append(native_tables["latent_quality"])
 
-        if config.run_native_contrastive:
-            native_tables = _run_native_for_scenario(
-                profiles=profiles,
-                feature_columns=feature_columns,
+            scenario_metrics = pd.concat(all_metrics, ignore_index=True, sort=False)
+            scenario_subset = scenario_metrics.loc[
+                scenario_metrics["benchmark_run_id"].eq(benchmark_run_id)
+            ].copy()
+            scenario_pass_fail = score_synthetic_scenario(
+                metrics=scenario_subset,
                 scenario_name=scenario_name,
-                scenario_dir=scenario_dir,
-                config=config,
-                logger=logger,
             )
-            all_metrics.append(native_tables["metrics"])
-            all_training.append(native_tables["training_summary"])
-            all_quality.append(native_tables["latent_quality"])
+            scenario_pass_fail.insert(0, "benchmark_run_id", benchmark_run_id)
+            scenario_pass_fail.insert(2, "seed", int(seed_value))
+            all_pass_fail.append(scenario_pass_fail)
+            write_table(data_frame=scenario_subset, path=scenario_dir / "scenario_metric_summary.tsv", logger=logger)
+            write_table(data_frame=scenario_pass_fail, path=scenario_dir / "scenario_pass_fail.tsv", logger=logger)
 
-        scenario_metrics = pd.concat(all_metrics, ignore_index=True, sort=False)
-        scenario_subset = scenario_metrics.loc[scenario_metrics["scenario"].eq(scenario_name)].copy()
-        scenario_pass_fail = score_synthetic_scenario(
-            metrics=scenario_subset,
-            scenario_name=scenario_name,
-        )
-        all_pass_fail.append(scenario_pass_fail)
-        write_table(data_frame=scenario_subset, path=scenario_dir / "scenario_metric_summary.tsv", logger=logger)
-        write_table(data_frame=scenario_pass_fail, path=scenario_dir / "scenario_pass_fail.tsv", logger=logger)
-
+    metric_summary = pd.concat(all_metrics, ignore_index=True, sort=False)
+    pass_fail_summary = pd.concat(all_pass_fail, ignore_index=True, sort=False)
+    decision_summary = summarise_comprehensive_validation(
+        metrics=metric_summary,
+        pass_fail=pass_fail_summary,
+    )
     outputs = {
-        "synthetic_metric_summary": pd.concat(all_metrics, ignore_index=True, sort=False),
-        "synthetic_pass_fail_summary": pd.concat(all_pass_fail, ignore_index=True, sort=False),
+        "synthetic_metric_summary": metric_summary,
+        "synthetic_pass_fail_summary": pass_fail_summary,
+        "synthetic_validation_decision_summary": decision_summary,
+        "synthetic_benchmark_manifest": pd.DataFrame.from_records(benchmark_records),
         "synthetic_scenario_configs": pd.concat(scenario_tables, ignore_index=True, sort=False),
     }
     if all_training:
@@ -1013,6 +1275,8 @@ def _run_native_for_scenario(
     profiles: pd.DataFrame,
     feature_columns: Sequence[str],
     scenario_name: str,
+    benchmark_run_id: str,
+    seed_value: int,
     scenario_dir: Path,
     config: LatentBenchmarkConfig,
     logger: Optional[logging.Logger],
@@ -1035,8 +1299,8 @@ def _run_native_for_scenario(
         temperature=float(config.temperature),
         validation_fraction=float(config.validation_fraction),
         steps_per_epoch=config.steps_per_epoch,
-        random_state=int(config.random_state),
-        positive_column="cpd_id",
+        random_state=int(seed_value),
+        positive_column="training_cpd_id",
         n_threads=int(config.threads),
     )
     result = fit_native_contrastive_backend(
@@ -1056,25 +1320,39 @@ def _run_native_for_scenario(
         calculate_validation_to_train_retrieval_metrics(
             embedding=latent,
             validation_fraction=float(config.validation_fraction),
-            random_state=int(config.random_state),
+            random_state=int(seed_value),
             n_neighbours=config.n_neighbours,
             threads=config.threads,
             method_name="cpatk_contrastive",
         )
     )
     latent_metrics = pd.concat([latent_metrics, latent_validation_metrics], ignore_index=True, sort=False)
-    latent_metrics.insert(0, "scenario", scenario_name)
-    latent_neighbours.insert(0, "scenario", scenario_name)
+    latent_metrics.insert(0, "benchmark_run_id", benchmark_run_id)
+    latent_metrics.insert(1, "scenario", scenario_name)
+    latent_metrics.insert(2, "seed", int(seed_value))
+    latent_neighbours.insert(0, "benchmark_run_id", benchmark_run_id)
+    latent_neighbours.insert(1, "scenario", scenario_name)
+    latent_neighbours.insert(2, "seed", int(seed_value))
     if not latent_validation_neighbours.empty:
-        latent_validation_neighbours.insert(0, "scenario", scenario_name)
+        latent_validation_neighbours.insert(0, "benchmark_run_id", benchmark_run_id)
+        latent_validation_neighbours.insert(1, "scenario", scenario_name)
+        latent_validation_neighbours.insert(2, "seed", int(seed_value))
     training_summary = result.training_summary.copy()
-    training_summary.insert(0, "scenario", scenario_name)
+    training_summary.insert(0, "benchmark_run_id", benchmark_run_id)
+    training_summary.insert(1, "scenario", scenario_name)
+    training_summary.insert(2, "seed", int(seed_value))
     training_loss = result.training_loss.copy()
-    training_loss.insert(0, "scenario", scenario_name)
+    training_loss.insert(0, "benchmark_run_id", benchmark_run_id)
+    training_loss.insert(1, "scenario", scenario_name)
+    training_loss.insert(2, "seed", int(seed_value))
     positive_report = result.positive_label_report.copy()
-    positive_report.insert(0, "scenario", scenario_name)
+    positive_report.insert(0, "benchmark_run_id", benchmark_run_id)
+    positive_report.insert(1, "scenario", scenario_name)
+    positive_report.insert(2, "seed", int(seed_value))
     split_report = result.split_report.copy()
-    split_report.insert(0, "scenario", scenario_name)
+    split_report.insert(0, "benchmark_run_id", benchmark_run_id)
+    split_report.insert(1, "scenario", scenario_name)
+    split_report.insert(2, "seed", int(seed_value))
     clipn_config = ClipnAdapterConfig(
         backend_module="cpatk_contrastive",
         id_column="cpd_id",
@@ -1088,8 +1366,10 @@ def _run_native_for_scenario(
     )
     diagnostic_summary = diagnostic_tables.get("latent_diagnostic_summary", pd.DataFrame()).copy()
     if not diagnostic_summary.empty:
-        diagnostic_summary.insert(0, "scenario", scenario_name)
-        diagnostic_summary.insert(1, "method", "cpatk_contrastive")
+        diagnostic_summary.insert(0, "benchmark_run_id", benchmark_run_id)
+        diagnostic_summary.insert(1, "scenario", scenario_name)
+        diagnostic_summary.insert(2, "seed", int(seed_value))
+        diagnostic_summary.insert(3, "method", "cpatk_contrastive")
     write_table(data_frame=latent, path=scenario_dir / "cpatk_contrastive_latent.tsv.gz", logger=logger)
     write_table(data_frame=training_loss, path=scenario_dir / "cpatk_contrastive_training_loss.tsv", logger=logger)
     write_table(data_frame=training_summary, path=scenario_dir / "cpatk_contrastive_training_summary.tsv", logger=logger)
@@ -1270,6 +1550,149 @@ def _metric_value(
         return float("nan")
 
 
+def summarise_comprehensive_validation(
+    *,
+    metrics: pd.DataFrame,
+    pass_fail: pd.DataFrame,
+) -> pd.DataFrame:
+    """Summarise repeated synthetic runs into scenario-level decisions."""
+    if metrics.empty:
+        return pd.DataFrame()
+    pivot = metrics.pivot_table(
+        index=["scenario", "seed", "method"],
+        columns="metric",
+        values="value",
+        aggfunc="first",
+    ).reset_index()
+    rows = []
+    for scenario, block in pivot.groupby("scenario", sort=False):
+        native = block.loc[block["method"].eq("cpatk_contrastive")].copy()
+        raw = block.loc[block["method"].eq("raw_scaled_features")].copy()
+        pca = block.loc[block["method"].eq("pca")].copy()
+        top_col = "validation_to_train_top1_same_compound_rate"
+        dataset_col = "validation_to_train_top1_same_dataset_rate"
+        batch_col = "validation_to_train_top1_same_batch_rate"
+        all_col = "top1_same_compound_rate"
+        native_top = _series_or_nan(frame=native, column=top_col)
+        raw_top = _series_or_nan(frame=raw, column=top_col)
+        pca_top = _series_or_nan(frame=pca, column=top_col)
+        native_all = _series_or_nan(frame=native, column=all_col)
+        overfit_gap = native_all - native_top if native_top.shape == native_all.shape else np.full(native_top.shape, np.nan)
+        failed_checks = pass_fail.loc[
+            pass_fail["scenario"].eq(scenario) & ~pass_fail["passed"].astype(bool)
+        ]
+        if native.empty:
+            rows.append(
+                {
+                    "scenario": scenario,
+                    "n_seeds": 0,
+                    "decision": "not_run",
+                    "native_validation_top1_mean": np.nan,
+                    "native_validation_top1_sd": np.nan,
+                    "raw_validation_top1_mean": _safe_nanmean(raw_top),
+                    "pca_validation_top1_mean": _safe_nanmean(pca_top),
+                    "native_minus_best_baseline_mean": np.nan,
+                    "native_dataset_leakage_mean": np.nan,
+                    "native_batch_leakage_mean": np.nan,
+                    "native_all_row_minus_validation_gap_mean": np.nan,
+                    "n_failed_checks": int(failed_checks.shape[0]),
+                    "target_or_warning_threshold": np.nan,
+                    "message": "Native contrastive was not run for this scenario.",
+                }
+            )
+            continue
+        if "no_biology" in str(scenario):
+            target = 0.10
+            decision = "pass" if _safe_nanmean(native_top) <= target else "fail"
+            message = "Negative-control held-out compound retrieval should stay near random."
+        elif str(scenario) in {"weak_biology", "label_noise_25pct", "high_missingness", "missing_compartment", "segmentation_outliers"}:
+            target = 0.15
+            decision = "pass" if _safe_nanmean(native_top) >= target else "warn"
+            message = "Hard stress scenarios should retain at least modest held-out retrieval."
+        else:
+            target = 0.40
+            decision = "pass" if _safe_nanmean(native_top) >= target else "warn"
+            message = "Biology-present scenarios should show useful held-out retrieval."
+        if failed_checks.shape[0] > max(0, native.shape[0] // 2) and decision == "pass":
+            decision = "warn"
+        rows.append(
+            {
+                "scenario": scenario,
+                "n_seeds": int(native.shape[0]),
+                "decision": decision,
+                "native_validation_top1_mean": _safe_nanmean(native_top),
+                "native_validation_top1_sd": _safe_nanstd(native_top),
+                "raw_validation_top1_mean": _safe_nanmean(raw_top),
+                "pca_validation_top1_mean": _safe_nanmean(pca_top),
+                "native_minus_best_baseline_mean": _safe_native_minus_baseline(native=native, raw=raw, pca=pca, column=top_col),
+                "native_dataset_leakage_mean": _safe_nanmean(_series_or_nan(frame=native, column=dataset_col)),
+                "native_batch_leakage_mean": _safe_nanmean(_series_or_nan(frame=native, column=batch_col)),
+                "native_all_row_minus_validation_gap_mean": _safe_nanmean(overfit_gap),
+                "n_failed_checks": int(failed_checks.shape[0]),
+                "target_or_warning_threshold": float(target),
+                "message": message,
+            }
+        )
+    summary = pd.DataFrame.from_records(rows)
+    if summary.empty:
+        return summary
+    decision_order = {"fail": 0, "warn": 1, "pass": 2}
+    summary["decision_rank"] = summary["decision"].map(decision_order).fillna(1).astype(int)
+    return summary.sort_values(["decision_rank", "scenario"]).drop(columns=["decision_rank"])
+
+
+
+def _safe_nanmean(values: np.ndarray) -> float:
+    """Return nanmean without runtime warnings for empty arrays."""
+    values = np.asarray(values, dtype=float)
+    if values.size == 0 or np.all(np.isnan(values)):
+        return float("nan")
+    return float(np.nanmean(values))
+
+
+def _safe_nanstd(values: np.ndarray) -> float:
+    """Return nanstd without runtime warnings for empty arrays."""
+    values = np.asarray(values, dtype=float)
+    if values.size == 0 or np.all(np.isnan(values)):
+        return float("nan")
+    return float(np.nanstd(values))
+
+
+def _safe_native_minus_baseline(
+    *,
+    native: pd.DataFrame,
+    raw: pd.DataFrame,
+    pca: pd.DataFrame,
+    column: str,
+) -> float:
+    """Calculate mean native improvement over the best baseline by seed."""
+    if native.empty or column not in native.columns:
+        return float("nan")
+    records = []
+    for _, row in native.iterrows():
+        seed = row.get("seed")
+        native_value = pd.to_numeric(pd.Series([row.get(column)]), errors="coerce").iloc[0]
+        baseline_values = []
+        for frame in [raw, pca]:
+            if column in frame.columns:
+                block = frame.loc[frame.get("seed").eq(seed)] if "seed" in frame.columns else frame
+                if not block.empty:
+                    baseline_values.append(
+                        pd.to_numeric(block[column], errors="coerce").max()
+                    )
+        if baseline_values and np.isfinite(native_value):
+            records.append(float(native_value - np.nanmax(baseline_values)))
+    if not records:
+        return float("nan")
+    return float(np.nanmean(records))
+
+def _series_or_nan(*, frame: pd.DataFrame, column: str) -> np.ndarray:
+    """Return a numeric series as an array, or NaNs matching frame rows."""
+    if column not in frame.columns:
+        return np.full(frame.shape[0], np.nan, dtype=float)
+    return pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+
+
 def run_synthetic_latent_benchmark_from_cli(
     *,
     output_dir: Path,
@@ -1291,6 +1714,8 @@ def run_synthetic_latent_benchmark_from_cli(
     hidden_dims: Sequence[int],
     dropout: float,
     random_state: int,
+    seed_values: Optional[Sequence[int]],
+    benchmark_mode: str,
     n_neighbours: int,
     threads: int,
     skip_native_contrastive: bool,
@@ -1323,6 +1748,8 @@ def run_synthetic_latent_benchmark_from_cli(
         hidden_dims=[int(value) for value in hidden_dims],
         dropout=float(dropout),
         random_state=int(random_state),
+        seed_values=[int(seed) for seed in (seed_values or [])],
+        benchmark_mode=str(benchmark_mode),
         n_neighbours=int(n_neighbours),
         threads=int(threads),
         run_native_contrastive=not bool(skip_native_contrastive),
