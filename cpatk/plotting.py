@@ -112,6 +112,7 @@ def plot_heatmap(
     title: str,
     value_label: str,
     logger: Optional[logging.Logger] = None,
+    n_jobs: int = 1,
 ) -> list[Path]:
     """Create a simple matrix heatmap.
 
@@ -127,12 +128,17 @@ def plot_heatmap(
         Colour-bar label.
     logger:
         Optional logger.
+    n_jobs:
+        Accepted for compatibility with threaded command-line entry points.
+        Plot rendering itself is single-threaded. Native numerical libraries may
+        still use their configured thread pools outside this function.
 
     Returns
     -------
     list[pathlib.Path]
         Written plot paths.
     """
+    _ = n_jobs
     values = matrix.to_numpy(dtype=float)
     plt.figure(figsize=(max(6, matrix.shape[1] * 0.5), max(4, matrix.shape[0] * 0.4)))
     image = plt.imshow(values, aspect="auto")
